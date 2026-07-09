@@ -1,12 +1,15 @@
+from collections.abc import Sequence
+from itertools import combinations
 import xml.etree.ElementTree as ET
-import pandas as pd
-import numpy as np 
+
 import cv2
+import numpy as np
+import pandas as pd
+from statsmodels.stats.multicomp import pairwise_tukeyhsd
 from tqdm import tqdm
-from scipy import stats
 
 
-def load_xml(path):
+def load_xml(path: str) -> pd.DataFrame:
     """    
     Loads .xml file and saves it as dataframe incl orientations and speed
     """
@@ -33,7 +36,7 @@ def load_xml(path):
 
     return df
 
-def count_stationary_traj(df, threshold=0.0):
+def count_stationary_traj(df: pd.DataFrame, threshold: float = 0.0) -> list[int]:
     """ 
     Calculates total distance moved for each trajectory based on starting and ending position
     and returns ids of trajectories that moved less than the treshold (considered stationary)
@@ -53,7 +56,7 @@ def count_stationary_traj(df, threshold=0.0):
     
     return stat_ids
 
-def fill_gaps_linear(df, verbose=True):
+def fill_gaps_linear(df: pd.DataFrame, verbose: bool = True) -> pd.DataFrame:
     """Fill time gaps by linearly interpolating positions between consecutive detections.
     
     Identifies gaps where dt > 1 for each particle, then inserts missing time points with
@@ -112,13 +115,126 @@ def fill_gaps_linear(df, verbose=True):
     
     return df
 
-def slice_time_window(df, t_start=0, t_end=None):
+
+def mean_dy_per_particle(df_treatment: pd.DataFrame, tank_id: int) -> float:
+    df_tank = df_treatment[df_treatment['tank'] == tank_id]
+    df_particle = df_tank.groupby('particle', as_index=False).agg(
+        dy=('dy', 'mean'),
+        nSpots=('dy', 'size'),
+    )
+    return np.average(df_particle['dy'], weights=df_particle['nSpots'])
+
+
+def compact_letter_display(
+    group_names: Sequence[str],
+    reject_lookup: dict[frozenset[str], bool],
+    group_means: dict[str, float],
+) -> dict[str, str]:
+    ordered_names = sorted(group_names, key=lambda name: group_means[name], reverse=True)
+    name_to_index = {name: idx for idx, name in enumerate(ordered_names)}
+    nonsig_pairs = {
+        tuple(sorted((name_to_index[a], name_to_index[b])))
+        for a, b in combinations(ordered_names, 2)
+        if not reject_lookup[frozenset((a, b))]
+    }
+
+    universe = set(range(len(ordered_names))) | nonsig_pairs
+    candidate_subsets = []
+
+    for subset_size in range(1, len(ordered_names) + 1):
+        for subset in combinations(range(len(ordered_names)), subset_size):
+            if all(tuple(sorted(pair)) in nonsig_pairs for pair in combinations(subset, 2)):
+                cover: set[object] = set(subset)
+                cover.update({tuple(sorted(pair)) for pair in combinations(subset, 2)})
+                candidate_subsets.append((subset, cover))
+
+    candidate_subsets.sort(key=lambda item: (-len(item[1]), len(item[0]), item[0]))
+
+    best_solution = None
+
+    def search(covered, chosen):
+        nonlocal best_solution
+        if best_solution is not None and len(chosen) >= len(best_solution):
+            return
+        if covered == universe:
+            best_solution = list(chosen)
+            return
+
+        target = next(iter(universe - covered))
+        for subset, cover in candidate_subsets:
+            if target in cover:
+                search(covered | cover, chosen + [subset])
+
+    search(set(), [])
+
+    letters = {}
+    for idx, name in enumerate(ordered_names):
+        letters[name] = ""
+
+    if best_solution is None:
+        return {name: "a" for name in group_names}
+
+    alphabet = [chr(ord('a') + i) for i in range(26)]
+    for letter_idx, subset in enumerate(best_solution):
+        letter = alphabet[letter_idx]
+        for idx in subset:
+            letters[ordered_names[idx]] += letter
+
+    return letters
+
+
+def tukey_posthoc(
+    group_names: Sequence[str],
+    group_values: Sequence[np.ndarray],
+) -> tuple[dict[str, float], dict[str, str], pd.DataFrame]:
+    combined_values = np.concatenate([np.asarray(values) for values in group_values])
+    combined_labels = np.concatenate([
+        np.repeat(name, len(values))
+        for name, values in zip(group_names, group_values)
+    ])
+
+    tukey = pairwise_tukeyhsd(combined_values, combined_labels, alpha=0.05)
+
+    reject_lookup: dict[frozenset[str], bool] = {}
+    pvalue_lookup: dict[frozenset[str], float] = {}
+    for row in tukey.summary().data[1:]:
+        group_a, group_b, meandiff, p_adj, lower, upper, reject = row
+        key = frozenset((group_a, group_b))
+        reject_lookup[key] = bool(reject)
+        pvalue_lookup[key] = float(p_adj)
+
+    group_means = {
+        name: float(np.mean(values))
+        for name, values in zip(group_names, group_values)
+    }
+    letters = compact_letter_display(group_names, reject_lookup, group_means)
+
+    summary_rows: list[dict[str, object]] = []
+    for row in tukey.summary().data[1:]:
+        group_a, group_b, meandiff, p_adj, lower, upper, reject = row
+        summary_rows.append({
+            'group1': group_a,
+            'group2': group_b,
+            'meandiff': meandiff,
+            'p_adj': p_adj,
+            'lower': lower,
+            'upper': upper,
+            'reject': reject,
+        })
+
+    return group_means, letters, pd.DataFrame(summary_rows)
+
+def slice_time_window(
+    df: pd.DataFrame,
+    t_start: int | float = 0,
+    t_end: int | float | None = None,
+) -> pd.DataFrame:
     """Return a copy of df restricted to the requested time window."""
     if t_end is None:
         return df[df['t'] >= t_start].copy()
     return df[(df['t'] >= t_start) & (df['t'] <= t_end)].copy()
 
-def calc_orientation_and_speed(df):
+def calc_orientation_and_speed(df: pd.DataFrame) -> pd.DataFrame:
 
     """
     Calculates the orientation and the speed of the particles and adds it to the dataframe
@@ -145,7 +261,7 @@ def calc_orientation_and_speed(df):
 
     return df
 
-def load_frames(path, total_frames=None, verbose=True):
+def load_frames(path: str, total_frames: int | None = None, verbose: bool = True) -> np.ndarray:
 
     """
     Function to load the video frames, supporting various compressions including PNG-compressed AVIs.
@@ -159,8 +275,8 @@ def load_frames(path, total_frames=None, verbose=True):
     frames = numpy array with all frames in video 
     """
 
-    frames = []
-    errors = []
+    frames: list[np.ndarray] = []
+    errors: list[str] = []
     
     # Method 1: Try imageio without specifying plugin (auto-detect)
     try:
@@ -289,162 +405,3 @@ def load_frames(path, total_frames=None, verbose=True):
         f"All methods failed:\n  - {error_summary}\n"
         f"For PNG-compressed AVIs, try: pip install av"
     )
-
-    return df_av, df_av_grouped
-
-# Unused helpers (commented out)
-# def fill_time_gaps(df, position_cols=("x", "y")):
-#     """Add missing frames per particle and linearly interpolate positions.
-#
-#     Expected columns: particle, t, and position columns (default: x, y).
-#     Returns a copy with inserted rows for missing integer t values between the
-#     first and last observation of each particle. Position columns are linearly
-#     interpolated; other columns are forward/back filled within the particle.
-#     A fresh dt column is added (frame difference per particle).
-#     """
-#     required = {"particle", "t"}
-#     missing = required - set(df.columns)
-#     if missing:
-#         raise ValueError(f"Missing required columns: {missing}")
-#
-#     if df.empty:
-#         return df.copy()
-#
-#     df_sorted = df.sort_values(["particle", "t"]).copy()
-#     if "dt" in df_sorted.columns:
-#         df_sorted = df_sorted.drop(columns=["dt"])
-#
-#     filled_parts = []
-#     for pid, grp in df_sorted.groupby("particle", sort=False):
-#         grp = grp.sort_values("t")
-#         full_t = pd.RangeIndex(grp["t"].min(), grp["t"].max() + 1, step=1)
-#
-#         expanded = grp.set_index("t").reindex(full_t)
-#         expanded["particle"] = pid
-#
-#         non_pos_cols = [c for c in expanded.columns if c not in position_cols]
-#         expanded[non_pos_cols] = expanded[non_pos_cols].ffill().bfill()
-#
-#         for col in position_cols:
-#             if col in expanded.columns:
-#                 expanded[col] = expanded[col].interpolate()
-#
-#         expanded = expanded.reset_index().rename(columns={"index": "t"})
-#         filled_parts.append(expanded)
-#
-#     out = pd.concat(filled_parts, ignore_index=True)
-#     out = out.sort_values(["particle", "t"]).reset_index(drop=True)
-#     out["dt"] = out.groupby("particle", sort=False)["t"].diff()
-#
-#     return out
-#
-# def get_scale(raw_frame, cropped_frame, w_raw_mm, binning):
-#     """Caclculates the mm/pxl scale taking into account the binning and original video width"""
-#     _, w_raw_pxl = raw_frame.shape # get dimensions raw video [pxl]
-#     _, w_cropped_pxl = cropped_frame.shape # get dimension cropped video [pxl]
-#
-#     w_cropped_mm = (w_raw_mm*w_cropped_pxl)/(w_raw_pxl/binning) # Calculate width of cropped video [mm]
-#
-#     scale = w_cropped_mm/w_cropped_pxl
-#
-#     return scale
-#
-# def compute_average_vector(df):
-#     """
-#     Computes the average vector from a DataFrame containing 'orientation' and 'magnitude'.
-#
-#     Parameters:
-#     df (pd.DataFrame): DataFrame with columns 'orientation' (angles in radians) and 'magnitude'.
-#
-#     Returns:
-#     tuple: (average_magnitude, average_angle) where:
-#         - average_magnitude (float): Magnitude of the average vector.
-#         - average_angle (float): Angle of the average vector in radians.
-#     """
-#
-#     # Compute weighted sum of dx and dy
-#     avg_dx = np.sum(df['dx']) / len(df) # np.sum(df['speed'])  * df['speed']
-#     avg_dy = np.sum(df['dy']) / len(df) # np.sum(df['speed'])  * df['speed']
-#     
-#     # Compute magnitude
-#     magnitude = np.sqrt(avg_dx**2 + avg_dy**2)
-#     
-#     # Compute orientation in degrees
-#     orientation = np.arctan2(avg_dy, avg_dx)
-#     
-#     return magnitude, orientation
-#
-#
-# def load_3tanks(measurement, treatment, path_to_tracking_results):
-#         
-#     dataframes=[]
-#     for tank in ['1', '2', '3']:
-#         path_xml = path_to_tracking_results + measurement + "\\tracking_results\\" + treatment + tank + ".xml"    
-#         
-#         df_tank = load_xml(path_xml)
-#         
-#         calc_orientation_and_speed(df_tank)
-#
-#         df_tank['tank'] = tank  # Add tank number to the dataframe
-#         dataframes.append(df_tank)
-#
-#     df = pd.concat(dataframes)
-#
-#     # remove shorter tracks
-#     # df = df[df['nSpots'] > 50].copy()
-#     # df.sort_values(['particle', 't']) 
-#
-#     return df
-#     
-# def calc_av_vecs(path_to_tracking_results, time_start, time_end):
-#     """
-#     Calculates average vector for each treatment in the following steps:
-#
-#     1. Load data from three tanks and treatments and calculate average vector for each tank
-#     2. Subtract background (nothing) from other treatments
-#     3. Calculate average vector for each treatment group (still, breeze, stormy) from the three tanks
-#
-#     Returns df with average vectors for each treatment and replicates, and df_av_grouped with mean for each treatment
-#     """
-#
-#     # Define treatments and tanks
-#     treatments = ['still', 'breeze', 'stormy']#, 'nothing']
-#     tanks = [1, 2, 3]
-#     average_vectors = []
-#
-#     # Calculate average vector for each treatment separately
-#     for treatment in treatments:
-#         for tank in tanks:
-#             path_xml = path_to_tracking_results + treatment + str(tank) + ".xml"
-#             df = load_xml(path_xml)
-#             # print(max(df['t']))
-#             df = df[(df['t'] > time_start) & (df['t'] < time_end)]
-#
-#             calc_orientation_and_speed(df)      
-#             m_av, or_av = compute_average_vector(df)
-#
-#             dx = m_av * np.cos(or_av) 
-#             dy = m_av * np.sin(or_av)
-#             
-#             # Append the results to the list
-#             average_vectors.append({
-#                 'treatment': treatment,
-#                 'tank': tank,
-#                 'm_av': m_av,
-#                 'or_av': np.degrees(or_av),
-#                 
-#                 'dx': dx,
-#                 'dy': dy
-#             })
-#
-#     df_av = pd.DataFrame(average_vectors)
-#     
-#     # Calculate mean for each column    
-#     df_av_grouped = df_av.groupby('treatment').agg({
-#         'dx': 'mean',
-#         'dy': 'mean',
-#         'm_av': 'mean',
-#         'or_av': 'mean'
-#     }).reset_index().rename(columns={'m_av': 'm', 'or_av': 'or'})
-#     
-#     return df_av, df_av_grouped

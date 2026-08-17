@@ -97,7 +97,6 @@ for condition in conditions:
     # print(f"\n{condition}")
     for tank in tanks:
         n = len(df[(df['Condition'] == condition) & (df['tank'] == tank)])
-        # print(f"  tank {tank}: {n:,} observations")
         numobs.append(n)
 
 # normalize number of counts per tank to the same number for each condition to avoid bias in the density estimation and plotting
@@ -110,13 +109,6 @@ for condition in conditions:
             df_tank_sampled = df_tank.sample(n=min_numobs, random_state=42)
             df = df.drop(df_tank.index)
             df = pd.concat([df, df_tank_sampled], ignore_index=True)
-
-# print number of observations after normalization
-# print("\nNumber of observations after normalization:")
-# for condition in conditions:
-#     for tank in tanks:
-#         n = len(df[(df['Condition'] == condition) & (df['tank'] == tank)])
-#         print(f"  {condition} - tank {tank}: {n:,} observations")
 
 # Binning and smoothing parameters per measurement
 if measurement == 'BarnacleLarvae_2102':
@@ -170,9 +162,10 @@ elif measurement == 'Cladocerans_2605':
 else:
     raise ValueError("Measurement not recognized. Please check the measurement variable.")
 
-#%%
+#%% Plot 
 
 
+# Make the plot
 bin_edges = np.linspace(-ylim_viol_main, ylim_viol_main, num_bins + 1)  # 3x more bins to capture quantization
 bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 bin_width = bin_edges[1] - bin_edges[0]
@@ -183,6 +176,7 @@ conditions = ['still', 'breeze', 'stormy']
 colors = sns.color_palette("Blues", 4)[1:]
 # colors = sns.color_palette("Set2", 3)
 
+# Create figure with cloud and boxplot for each condition in separate subplots, and polar histogram with swimming angle distribution on top of each subplot # Add some extra space for the cloud and boxplot
 cloud_width = xlim_viol * 0.7  # Max width of the density cloud (80% of xlim)
 curve_width = xlim_viol * f_curve  # Max width of the density curve (80% of cloud width)
 cloud_offset = 0.1 * xlim_viol
@@ -206,10 +200,13 @@ axes_viol = [fig.add_subplot(gs[1, i]) for i in range(3)]
 y_grid = np.linspace(-ylim_viol_main, ylim_viol_main, 600)
 
 for ax, condition, color in zip(axes_pol, conditions, colors):
+    # Define treatment
+
     d = df[df['Condition'] == condition].dropna(subset=['orientation', 'speed'])
     orientation_vals = d['orientation'].values
     speed_vals = d['speed'].values
 
+    # Robust, seam-free polar histogram
     theta = np.mod(orientation_vals, 2*np.pi)
     nbins = 50
     edges = np.linspace(0, 2*np.pi, nbins + 1)  # nbins + 1 edges for nbins bins
@@ -221,9 +218,14 @@ for ax, condition, color in zip(axes_pol, conditions, colors):
     ax.set_thetamin(0)    
     ax.set_ylim(0, ylim_pol_main)
     
+    # if condition == 'breeze':
+        # ax.set_title(r'Distribution of $\theta$', fontsize=10, pad=5)
+    
+    # disable polar labels and ticks
     ax.set_yticks([ylim_pol_main/3, 2*ylim_pol_main/3])
     ax.set_yticklabels(['', ''])
     ax.set_xticklabels([])
+    # ax.set_xticklabels([0, '' ,90, '', 180, '', 270, ''])
 
 
 for ax, condition, color in zip(axes_viol, conditions, colors):
@@ -234,6 +236,7 @@ for ax, condition, color in zip(axes_viol, conditions, colors):
                 
     data = df[df['Condition'] == condition]['dy'].dropna().values
     rand_ind = np.random.choice(len(data), size=min(100, len(data)), replace=False)
+    ### Density cloud
     if TEST:
         kde = gaussian_kde(data[rand_ind])
     else:
@@ -242,22 +245,27 @@ for ax, condition, color in zip(axes_viol, conditions, colors):
         
     density = kde(y_grid)
 
+    # Normalize the area under the density curve to 1, then scale to fit the subplot width
     area = np.trapezoid(density, y_grid)
     density = density / area
     
+    # Scale density to fit subplot width
     density = density * curve_width 
 
+    ### Plot density curves and filled area
     ax.plot(density, y_grid, color='black', linewidth=1, zorder=3)
     ax.fill_betweenx(y_grid, 0, density, color=color, alpha=0.7, zorder=2)
     
-    n_scatter = min(points_scatter, len(data))
-    mean = np.mean(data)
-    std = np.std(data)
+    ### Plot histogram with black line and colored fille
+    # ax.barh(bin_centers, -counts, height=bin_width, alpha=0.5, color='gray', zorder=1, antialiased=False, snap=True)
+        
     print(f"for condition {condition}: mean = {mean:.3f}, std = {std:.3f}, n = {len(data)}")
     
-    x_jitter = -np.random.uniform(cloud_offset, cloud_width-cloud_offset, size=n_scatter)
-    ax.scatter(x_jitter, np.random.choice(data, size=n_scatter, replace=False), s=1.5, color='grey', alpha=0.12, linewidth=0, zorder=4)
-
+    x_jitter = -np.random.uniform(cloud_offset, cloud_width-cloud_offset, size=points_scatter)
+    ax.scatter(x_jitter, np.random.choice(data, size=points_scatter, replace=False), s=1.5, color='grey', alpha=0.12, linewidth=0, zorder=4)
+    # ax.errorbar(-cloud_width/2, mean, yerr=std, fmt='o', color='black', markersize=3, zorder=5)
+    
+    # ### Boxplot
     ax.boxplot(data,
                 vert=True,
                 positions=[-cloud_width/2],
@@ -270,6 +278,9 @@ for ax, condition, color in zip(axes_viol, conditions, colors):
                 capprops=dict(color='black', linewidth=box_linewidth),
                 zorder = 5)
 
+    ### Styling
+    # if condition == 'breeze':
+    #     ax.set_title('Distribution of dy', fontsize=10, pad=5)
     ax.set_xlabel(condition, fontsize=10)
 
     ax.tick_params(axis='y', labelsize=8, length=0, rotation=60)
@@ -288,6 +299,7 @@ for ax, condition, color in zip(axes_viol, conditions, colors):
         spine.set_visible(False)
 
 
+# Add outer rectangle, same as your current plot
 ax_left = axes_viol[0].get_position().x0
 ax_bottom = axes_viol[0].get_position().y0
 ax_right = axes_viol[-1].get_position().x1
@@ -311,6 +323,11 @@ if not TEST:
     fig.savefig(os.path.join(path_to_figure_savelocation, f'{measurement}_full_per_species.svg'), dpi=1200, transparent=True,  bbox_inches='tight')
 
 
+# Make the plot with individual overlay for each tank, to show variability across tanks, and mean ± SD for each condition
+
+# Define bin edges for consistent binning across all conditions
+# Use high resolution bins to avoid quantization gaps from pixel-based coordinate data
+# Raw coordinates are integers, scaled by ~0.25 mm/pxl, so velocities are quantized
 bin_edges = np.linspace(-ylim_viol_main, ylim_viol_main, num_bins + 1)  # 3x more bins to capture quantization
 bin_centers = (bin_edges[:-1] + bin_edges[1:]) / 2
 bin_width = bin_edges[1] - bin_edges[0]
@@ -318,8 +335,10 @@ bin_width = bin_edges[1] - bin_edges[0]
 kernel = gaussian_kernel(smooth_kernel_size, smooth_sigma)
 
 conditions = ['still', 'breeze', 'stormy']
+# colors = sns.color_palette("Blues", 4)[1:]
 colors = ["#0072B2","#B20000", "#E69F00", "#009E73", "#CC79A7"][:len(tanks)]
 
+# Create figure with cloud and boxplot for each condition in separate subplots, and polar histogram with swimming angle distribution on top of each subplot # Add some extra space for the cloud and boxplot
 cloud_width = xlim_viol * 0.7  # Max width of the density cloud (80% of xlim)
 curve_width = xlim_viol * f_curve_overlay  # Max width of the density curve (80% of cloud width)
 cloud_offset = 0.1 * xlim_viol
@@ -340,10 +359,13 @@ axes_viol = [fig.add_subplot(gs[1, i]) for i in range(3)]
 y_grid = np.linspace(-ylim_viol_main, ylim_viol_main, 600)
 
 for ax, condition in zip(axes_pol, conditions):
+    # Define treatment
+
     d = df[df['Condition'] == condition].dropna(subset=['orientation', 'speed'])
     orientation_vals = d['orientation'].values
     speed_vals = d['speed'].values
 
+    # Robust, seam-free polar histogram
     theta = np.mod(orientation_vals, 2*np.pi)
     nbins = 50
     edges = np.linspace(0, 2*np.pi, nbins + 1)  # nbins + 1 edges for nbins bins
@@ -363,9 +385,14 @@ for ax, condition in zip(axes_pol, conditions):
     ax.set_thetamin(0)    
     ax.set_ylim(0, ylim_pol_overlay)
     
+    # if condition == 'breeze':
+        # ax.set_title(r'Distribution of $\theta$', fontsize=10, pad=5)
+    
+    # disable polar labels and ticks
     ax.set_yticks([ylim_pol_overlay/3, 2*ylim_pol_overlay/3])
     ax.set_yticklabels(['', ''])
     ax.set_xticklabels([])
+    # ax.set_xticklabels([0, '' ,90, '', 180, '', 270, ''])
 
 
 for ax, condition in zip(axes_viol, conditions):
@@ -376,6 +403,7 @@ for ax, condition in zip(axes_viol, conditions):
                 
     data = df[df['Condition'] == condition]['dy'].dropna().values
     rand_ind = np.random.choice(len(data), size=min(100, len(data)), replace=False)
+    ### Density cloud
     if TEST:
         kde = gaussian_kde(data[rand_ind])
     else:
@@ -384,13 +412,18 @@ for ax, condition in zip(axes_viol, conditions):
         
     density = kde(y_grid)
 
+    # Normalize the area under the density curve to 1, then scale to fit the subplot width
     area = np.trapezoid(density, y_grid)
     density = density / area
     
+    # Scale density to fit subplot width
     density = density * curve_width 
 
+    ### Plot density curves and filled area
+    # ax.plot(density, y_grid, color='black', linewidth=1, zorder=3)
     ax.fill_betweenx(y_grid, 0, density, color='gray', alpha=0.7, zorder=2)
     
+    ### Plot overlay density curves for each tank
     for tank in tanks:
         d_tank = df[(df['Condition'] == condition) & (df['tank'] == tank)].dropna(subset=['dy'])
         data_tank = d_tank['dy'].values
@@ -406,6 +439,9 @@ for ax, condition in zip(axes_viol, conditions):
     x_jitter = -np.random.uniform(cloud_offset, cloud_width-cloud_offset, size=points_scatter)
     ax.scatter(x_jitter, np.random.choice(data, size=points_scatter, replace=False), s=1.5, color='grey', alpha=0.12, linewidth=0, zorder=4)
 
+    ### Boxplot
+    # Tank-level mean dy points
+
     x_points = np.linspace(-cloud_width*0.85, -cloud_width*0.35, len(tanks))
     for x, tank in zip(x_points, tanks):
         d_tank = df[(df['Condition'] == condition) & (df['tank'] == tank)]
@@ -415,6 +451,24 @@ for ax, condition in zip(axes_viol, conditions):
         ax.scatter(x, tank_mean, s=10, color=colors[tank-1], edgecolor='none', linewidth=0.4, zorder=6)
         ax.errorbar(x, tank_mean, yerr=tank_sd, fmt='o', color=colors[tank-1], markersize=3, capsize=2, linewidth=1, zorder=7)
 
+
+
+    # ax.errorbar(-cloud_width*0.5, mean_tank,
+    #             yerr=sd_tank,
+    #             fmt='o',
+    #             color=colors[tank-1],
+    #             markersize=3,
+    #             capsize=2,
+    #             linewidth=1,
+    #             zorder=7)
+
+    ### Mean ± SD
+    # mean_val = np.mean(data)
+    # std_val = np.std(data)
+
+    ### Styling
+    # if condition == 'breeze':
+    #     ax.set_title('Distribution of dy', fontsize=10, pad=5)
     ax.set_xlabel(condition, fontsize=10)
 
     ax.tick_params(axis='y', labelsize=8, length=0, rotation=60)
@@ -433,6 +487,7 @@ for ax, condition in zip(axes_viol, conditions):
         spine.set_visible(False)
 
 
+# Add outer rectangle, same as your current plot
 ax_left = axes_viol[0].get_position().x0
 ax_bottom = axes_viol[0].get_position().y0
 ax_right = axes_viol[-1].get_position().x1
@@ -455,6 +510,8 @@ if not TEST:
     fig.savefig(os.path.join(path_to_figure_savelocation_overlay, f'{measurement}_full_per_species.png'), dpi=1200, transparent=True, bbox_inches='tight')
     fig.savefig(os.path.join(path_to_figure_savelocation_overlay, f'{measurement}_full_per_species.svg'), dpi=1200, transparent=True, bbox_inches='tight')
 
+#%% Create a flat legend for the tanks
+from matplotlib.lines import Line2D
 legend_elements = [Line2D([0], [0], color=colors[i], lw=2, label=f'Tank {tank}') for i, tank in enumerate(tanks)]
 
 fig_legend = plt.figure(figsize=(2, 0.1))
@@ -466,6 +523,8 @@ fig_legend.savefig(os.path.join(path_to_figure_savelocation, f'{measurement}_tan
 
 print("saved legend at", os.path.join(path_to_figure_savelocation, f'{measurement}_tank_legend.png'))
 print("saved legend at", os.path.join(path_to_figure_savelocation, f'{measurement}_tank_legend.svg'))
+
+#%% Plot control measurements for all species: no overlays + tank overlays
 
 w_control_mm = 210/2*0.9
 factor_control_height = 1.2
@@ -496,6 +555,7 @@ control_plot_settings = {
     "num_bins": 71,
     "points_scatter": 3000,
 }
+# Load control data
 dfs_control = []
 
 for measurement_i in control_measurements:
@@ -510,6 +570,7 @@ for measurement_i in control_measurements:
 
 df_control_all = pd.concat(dfs_control, ignore_index=True)
 
+# Normalize number of observations per species/tank
 numobs = []
 for measurement_i in control_measurements:
     tanks_i = [1, 2, 3, 4, 5] if measurement_i == "Cladocerans_2605" else [1, 2, 3]
@@ -555,6 +616,7 @@ bin_width = bin_edges[1] - bin_edges[0]
 species_order = [species_labels[m] for m in control_measurements]
 blue_colors = sns.color_palette("Blues", 4)[1:]
 
+# color control is slightly darker than stormy
 color_control = sns.color_palette("Blues", 4)[2]
 tank_colors = ["#0072B2", "#B20000", "#E69F00", "#009E73", "#CC79A7"]
 
@@ -564,6 +626,8 @@ cloud_width = xlim_viol * 0.7
 cloud_offset = 0.1 * xlim_viol
 box_width = cloud_width * 0.4
 box_linewidth = 1
+
+# plot control, no overlays
 
 curve_width = xlim_viol * f_curve
 
@@ -603,6 +667,7 @@ for ax, species in zip(axes_viol, species_order):
 
     kde = gaussian_kde(data)
     
+    # normalize with respect to max peak height, to show differences in distribution shape rather than absolute density (which is affected by number of observations and variability across tanks)
     density = kde(y_grid)
     area = np.trapezoid(density, y_grid)
     peak = np.max(density)

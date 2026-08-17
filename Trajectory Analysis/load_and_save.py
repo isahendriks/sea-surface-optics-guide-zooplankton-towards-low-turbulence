@@ -4,6 +4,7 @@ import os
 import pickle
 import matplotlib.pyplot as plt
 import scipy as sp
+
 from post_processing_functions import (
     count_stationary_traj,
     fill_gaps_linear,
@@ -13,7 +14,7 @@ from post_processing_functions import (
     tukey_posthoc,
 )
 
-
+# Define the measurement to analyze
 measurement = 'Cladocerans_2605'
 
 path_to_tracking_data = "R:\\LU24A1047-PLS\\TrackingData\\"

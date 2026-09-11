@@ -108,7 +108,7 @@ t_simulation = 60 # total length of simulation [s]
 N_plankton = 100 # Number of plankters
 
 ### Parameters for velocity field (in SI units * 1e6 to convert to mm)
-epsilon = 1e-10 * 1e6 # Dissipation rate , ranges from 1e-4 (rough sea) to 1e-14 (calm sea) - *1e-6 to convert to mm
+epsilon = 1e-8 * 1e6 # Dissipation rate , ranges from 1e-4 (rough sea) to 1e-14 (calm sea) - *1e-6 to convert to mm
 nu = 1e-6 * 1e6 # Kinematic viscosity of sea water depends on salinity and temperature. Ranges from 1e-6 to 1.8e-6, times 1e-6 to convert to mm
 N = 50 # Total number of wave numbers sampled
 L = tank_size / 5 # Maximum length scale of turbulence [mm]

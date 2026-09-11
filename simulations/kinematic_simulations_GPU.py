@@ -16,6 +16,88 @@ def velocity_at(positions, t):
     u = np.cos(phase) @ A_n + np.sin(phase) @ B_n        # (M, 2)
     return u[:, 0], u[:, 1]
 
+
+# %% Extract parameters from experimental data to set plankton parameters
+### Read the data from experiments
+measurement = "BarnacleLarvae_2102"  # "Artemia" or "Barnacle_Larvae" or "Cladocerans"
+path_to_still = r"R:\\LU24A1047-PLS\\TrackingData\\" + measurement + r"\\trajectories_scaled\\traj_still_scaled.pkl"
+path_to_control = r"R:\\LU24A1047-PLS\\TrackingData\\" + measurement + r"\\trajectories_scaled\\traj_nothing_scaled.pkl"
+
+df_still = pd.read_pickle(path_to_still)
+df_control = pd.read_pickle(path_to_control)
+
+df_still = df_still.dropna(subset=["speed", "orientation"])
+df_control = df_control.dropna(subset=["speed", "orientation"])
+
+# velocity: mean directed swimming speed from the stimulus condition [mm/s]
+velocity_measurement = df_still["speed"].mean()
+
+# response_angle: half-width of a uniform heading spread around target_angle (90 deg)
+# that reproduces the measured resultant length R of the still condition
+target_angle = np.pi / 2
+R_still = np.sqrt(np.mean(np.cos(df_still["orientation"])) ** 2 + np.mean(np.sin(df_still["orientation"])) ** 2)
+response_angle_measurement = brentq(lambda a: np.sinc(a / np.pi) - R_still, 1e-6, np.pi - 1e-6)
+
+# Dt: random swimming component from the no-stimulus control condition [mm^2/s]
+# matches mean-squared displacement over one frame interval (delta_t) to the model's 2*Dt*delta_t
+delta_t_meas = 0.1  # video frame interval [s]
+Dt_measurement = np.mean(df_control["speed"] ** 2) * delta_t_meas / 4
+
+# reorientation_rate: mean number of heading-randomization events per second [1/s], estimated
+# from the decay of the heading autocorrelation function over time lag tau.
+# Model: the heading holds steady and resets to a fresh iid draw at Poisson rate lambda
+# (a renewal process - same model used for `phi` in the plankton simulation loop). For such
+# a process, C(tau) = E[cos(phi(t+tau) - phi(t))] = R^2 + (1 - R^2) * exp(-lambda * tau),
+# where R is the resultant length of the heading distribution (R_still, computed above).
+# Fitting the exponential decay of the measured C(tau) therefore gives lambda directly, in
+# physical units of 1/s - independent of the video frame rate (unlike a raw per-frame turning
+# rate), which is what makes it usable as `reorientation_rate` at any simulation fps.
+max_lag_frames = 30
+lags = np.arange(1, max_lag_frames + 1)
+cos_dphi_by_lag = {lag: [] for lag in lags}
+
+for _, track in df_still.groupby("particle"):
+    t_to_phi = dict(zip(track["t"], track["orientation"]))
+    for t0, phi0 in t_to_phi.items():
+        for lag in lags:
+            phi1 = t_to_phi.get(t0 + lag)  # skips gaps: only exact lag-frame-apart pairs are used
+            if phi1 is not None:
+                cos_dphi_by_lag[lag].append(np.cos(phi1 - phi0))
+
+C_tau = np.array([np.mean(cos_dphi_by_lag[lag]) if cos_dphi_by_lag[lag] else np.nan for lag in lags])
+tau_seconds = lags * delta_t_meas
+
+# Only the part of the decay still above the R_still^2 asymptote is usable (log needs a positive argument)
+valid = ~np.isnan(C_tau) & (C_tau > R_still ** 2)
+slope, _ = np.polyfit(tau_seconds[valid], np.log(C_tau[valid] - R_still ** 2), 1)
+reorientation_rate_measurement = -slope
+
+print(f"velocity = {velocity_measurement:.4f} mm/s")
+print(f"response_angle = {np.degrees(response_angle_measurement):.2f} deg")
+print(f"Dt = {Dt_measurement:.4e} mm^2/s")
+print(f"reorientation_rate = {reorientation_rate_measurement:.4f} s^-1")
+
+### Saved results ###
+# Artemia data: 
+# velocity = 2.4456 mm/s
+# response_angle = 154.12 deg
+# Dt = 2.1989e-01 mm^2/s
+# reorientation_rate = 0.1628 s^-1
+
+# Barnacle Larvae:
+# velocity = 1.1411 mm/s
+# response_angle = 179.12 deg
+# Dt = 9.2954e-02 mm^2/s
+# reorientation_rate = 0.1064 s^-1 
+
+# Cladocerans: 
+# velocity = 2.0006 mm/s
+# response_angle = 152.66 deg
+# Dt = 1.5735e-01 mm^2/s
+# reorientation_rate = 0.2326 
+# 
+
+
 # %% Set parameters for simulation
 
 ### Simulation parameters
@@ -26,7 +108,7 @@ t_simulation = 60 # total length of simulation [s]
 N_plankton = 100 # Number of plankters
 
 ### Parameters for velocity field (in SI units * 1e6 to convert to mm)
-epsilon = 1e-4 * 1e6 # Dissipation rate , ranges from 1e-4 (rough sea) to 1e-14 (calm sea) - *1e-6 to convert to mm
+epsilon = 1e-10 * 1e6 # Dissipation rate , ranges from 1e-4 (rough sea) to 1e-14 (calm sea) - *1e-6 to convert to mm
 nu = 1e-6 * 1e6 # Kinematic viscosity of sea water depends on salinity and temperature. Ranges from 1e-6 to 1.8e-6, times 1e-6 to convert to mm
 N = 50 # Total number of wave numbers sampled
 L = tank_size / 5 # Maximum length scale of turbulence [mm]
@@ -34,16 +116,17 @@ eta = (nu**3 / epsilon) ** (1/4)   # Define eta (Kolmogorov length scale)
 dx_physics = eta/2 # physical/turbulence modelling resolution [mm] - smallest eddy the Fourier modes can represent should be <= eta/2
 
 ### Plankton parameters
-set_turbulence = False
+set_turbulence = True
 
 ### Starting conditions of plankton (based on real swimmers)
-velocity = 5 #2.4456 # mean upward velocity [mm/s]
-angle = 154.12 # in degrees (plus or minus around the target angle 90 degrees)
+velocity = 2.4456 #2.4456 # mean upward velocity [mm/s]
+angle = 154.12 / 2 # in degrees (plus or minus around the target angle 90 degrees)
 Dt = 2.1989e-1 # random swimming component from control [mm^2/s]
-reorientation_rate = 2.0 # mean number of heading-reorientation events per second [s^-1] 
+reorientation_rate = 0.1628 # mean number of heading-reorientation events per second [s^-1] 
 
 ### Video parameters
-stride = 6 # number of grid points to skip when plotting the quiver plot (for clarity)
+N_quivers = 30
+stride = int(grid_size / N_quivers) # number of grid points to skip when plotting the quiver plot (for clarity)
 step = 1 # number of frames to skip when creating the video (for speed)
 
 ### Create grid for the simulation
@@ -222,87 +305,6 @@ else:
     print("Interpolation check passed.")
 
 
-# %% Extract parameters from experimental data to set plankton parameters
-### Read the data from experiments
-# measurement = "Cladocerans_2605"
-# path_to_still = r"R:\\LU24A1047-PLS\\TrackingData\\" + measurement + r"\\trajectories_scaled\\traj_still_scaled.pkl"
-# path_to_control = r"R:\\LU24A1047-PLS\\TrackingData\\" + measurement + r"\\trajectories_scaled\\traj_nothing_scaled.pkl"
-
-# df_still = pd.read_pickle(path_to_still)
-# df_control = pd.read_pickle(path_to_control)
-
-
-# df_still = df_still.dropna(subset=["speed", "orientation"])
-# df_control = df_control.dropna(subset=["speed", "orientation"])
-
-# # velocity: mean directed swimming speed from the stimulus condition [mm/s]
-# velocity_measurement = df_still["speed"].mean()
-
-# # response_angle: half-width of a uniform heading spread around target_angle (90 deg)
-# # that reproduces the measured resultant length R of the still condition
-# target_angle = np.pi / 2
-# R_still = np.sqrt(np.mean(np.cos(df_still["orientation"])) ** 2 + np.mean(np.sin(df_still["orientation"])) ** 2)
-# response_angle_measurement = brentq(lambda a: np.sinc(a / np.pi) - R_still, 1e-6, np.pi - 1e-6)
-
-# # Dt: random swimming component from the no-stimulus control condition [mm^2/s]
-# # matches mean-squared displacement over one frame interval (delta_t) to the model's 2*Dt*delta_t
-# delta_t_meas = 0.1  # video frame interval [s]
-# Dt_measurement = np.mean(df_control["speed"] ** 2) * delta_t_meas / 4
-
-# # reorientation_rate: mean number of heading-randomization events per second [1/s], estimated
-# # from the decay of the heading autocorrelation function over time lag tau.
-# # Model: the heading holds steady and resets to a fresh iid draw at Poisson rate lambda
-# # (a renewal process - same model used for `phi` in the plankton simulation loop). For such
-# # a process, C(tau) = E[cos(phi(t+tau) - phi(t))] = R^2 + (1 - R^2) * exp(-lambda * tau),
-# # where R is the resultant length of the heading distribution (R_still, computed above).
-# # Fitting the exponential decay of the measured C(tau) therefore gives lambda directly, in
-# # physical units of 1/s - independent of the video frame rate (unlike a raw per-frame turning
-# # rate), which is what makes it usable as `reorientation_rate` at any simulation fps.
-# max_lag_frames = 30
-# lags = np.arange(1, max_lag_frames + 1)
-# cos_dphi_by_lag = {lag: [] for lag in lags}
-
-# for _, track in df_still.groupby("particle"):
-#     t_to_phi = dict(zip(track["t"], track["orientation"]))
-#     for t0, phi0 in t_to_phi.items():
-#         for lag in lags:
-#             phi1 = t_to_phi.get(t0 + lag)  # skips gaps: only exact lag-frame-apart pairs are used
-#             if phi1 is not None:
-#                 cos_dphi_by_lag[lag].append(np.cos(phi1 - phi0))
-
-# C_tau = np.array([np.mean(cos_dphi_by_lag[lag]) if cos_dphi_by_lag[lag] else np.nan for lag in lags])
-# tau_seconds = lags * delta_t_meas
-
-# # Only the part of the decay still above the R_still^2 asymptote is usable (log needs a positive argument)
-# valid = ~np.isnan(C_tau) & (C_tau > R_still ** 2)
-# slope, _ = np.polyfit(tau_seconds[valid], np.log(C_tau[valid] - R_still ** 2), 1)
-# reorientation_rate_measurement = -slope
-
-# print(f"velocity = {velocity_measurement:.4f} mm/s")
-# print(f"response_angle = {np.degrees(response_angle_measurement):.2f} deg")
-# print(f"Dt = {Dt_measurement:.4e} mm^2/s")
-# print(f"reorientation_rate = {reorientation_rate_measurement:.4f} 1/s")
-
-# 
-# Artemia data: 
-# velocity = 2.4456 mm/s
-# response_angle = 154.12 deg
-# Dt = 2.1989e-01 mm^2/s
-# 
-# Barnacle Larvae:
-# velocity = 1.1411 mm/s
-# response_angle = 179.12 deg
-# Dt = 9.2954e-02 mm^2/s
-# 
-# Cladocerans: 
-# velocity = 2.0006 mm/s
-# response_angle = 152.66 deg
-# Dt = 1.5735e-01 mm^2/s
-# 
-# 
-
-# %% Set plankton parameters based on experimental data (Artemia)
-
 # %% Coupling the velocity field with the plankton swimming and random noise
 target_angle = np.pi / 2
 response_angle = angle * (np.pi / 180)
@@ -328,9 +330,7 @@ if reorientation_rate * delta_t > 0.5:
 for t in range(timesteps):
     print(f"\r Simulating plankton movement for timestep {t}/{timesteps} ...", end='', flush=True)
 
-    # Reorient a subset of plankton this step (Poisson-process approximation at rate reorientation_rate
-    # [1/s]); everyone else keeps their previous heading. This ties the reorientation correlation time to
-    # a physical rate instead of the simulation timestep, so results converge as fps increases.
+    # Reorient a subset of plankton this step (Poisson-process approximation at rate reorientation_rate [s^-1]); 
     reorient = np.random.rand(N_plankton) < reorientation_rate * delta_t
     phi[reorient] = target_angle + response_angle * (2 * np.random.rand(int(reorient.sum())) - 1)
 
@@ -360,12 +360,20 @@ for t in range(timesteps):
     stored_positions[:, 0, t] = x_pos
     stored_positions[:, 1, t] = y_pos
 
+### Save stored positions into a dataframe for later analysis
+df_positions = pd.DataFrame({
+    'id': np.repeat(np.arange(N_plankton), timesteps),
+    't': np.tile(np.arange(timesteps), N_plankton),
+    'xpos': stored_positions[:, 0, :].flatten(),
+    'ypos': stored_positions[:, 1, :].flatten()
+})
+
 # %% Create animation of velocity field with plankton swimming through it
 # Video parameters
 trail_length = 20  # Number of previous positions to show in the trail
 
 # Set up the figure and axis for the quiver plot
-fig, ax = plt.subplots(figsize=(8, 8))
+fig, ax = plt.subplots(figsize=(6, 6))
 
 Xs = X[::stride, ::stride]
 Ys = Y[::stride, ::stride]
@@ -389,9 +397,16 @@ ax.legend(loc='upper right')  # created once, not touched again
 # Function to update the plot for each frame
 def update(frame):
     print(f"\rProcessing frame {frame}/{timesteps} ...", end='', flush=True)
+
     U = velocity_field[frame, ::stride, ::stride, 0]
     V = velocity_field[frame, ::stride, ::stride, 1]
-    quiver.set_UVC(U, V)
+
+    if set_turbulence:
+        quiver.set_UVC(U, V)
+
+    else:
+        quiver.set_UVC(np.zeros_like(U), np.zeros_like(V))
+    
     title.set_text(f"T = {frame/fps:.2f} s")
     scat.set_offsets(np.c_[stored_positions[:, 0, frame], stored_positions[:, 1, frame]])
 
@@ -407,7 +422,7 @@ anim.save(gif_path, writer=PillowWriter(fps=fps/step))
 plt.close(fig)
 Image(filename=gif_path)
 
-# %% Print all the parameters in this simulation
+### Print all the parameters in this simulation
 
 print("Simulation Parameters:")
 print(f"Tank size: {tank_size} mm")
@@ -422,3 +437,5 @@ print(f"Frame rate: {fps} fps")
 print(f"Reorientation rate: {reorientation_rate} 1/s (reorientation_rate * delta_t = {reorientation_rate * delta_t:.3f})")
 print(f"Step size of video: {step}")
 print(f"Stride for quiver plot: {stride}")
+
+# %%

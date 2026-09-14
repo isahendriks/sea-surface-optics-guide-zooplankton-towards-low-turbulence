@@ -309,7 +309,7 @@ for epsilon in epsilon_sim_vid:
 
     anim = FuncAnimation(fig, update, frames=frame_indices, interval=50, blit=True)
 
-    gif_path = "simulation_epsilon_{epsilon:.2e}.gif"
+    gif_path = f"simulation_epsilon_{epsilon:.2e}.gif"
     anim.save(gif_path, writer=PillowWriter(fps=fps/step))
     plt.close(fig)
     Image(filename=gif_path)

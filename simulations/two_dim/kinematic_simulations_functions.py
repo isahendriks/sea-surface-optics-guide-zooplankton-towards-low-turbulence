@@ -183,8 +183,8 @@ N_plankton = 500 # Number of plankters
 ### Parameters for velocity field (in SI units * 1e6 to convert to mm)
 epsilon = 1e-8 * 1e6 # Dissipation rate , ranges from 1e-4 (rough sea) to 1e-14 (calm sea) - *1e-6 to convert to mm
 nu = 1e-6 * 1e6 # Kinematic viscosity of sea water depends on salinity and temperature. Ranges from 1e-6 to 1.8e-6, times 1e-6 to convert to mm
-N = 50 # Total number of wave numbers sampled
-L = tank_size/3 # Maximum length scale of turbulence [mm]
+N = 10 # Total number of wave numbers sampled
+L = tank_size # Maximum length scale of turbulence [mm]
 eta = (nu**3 / epsilon) ** (1/4)   # Define eta (Kolmogorov length scale)
 dx_physics = eta/2 # physical/turbulence modelling resolution [mm] - smallest eddy the Fourier modes can represent should be <= eta/2
 

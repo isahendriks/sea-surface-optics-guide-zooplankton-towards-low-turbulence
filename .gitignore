@@ -15,6 +15,12 @@ env/
 *.gif
 *.mp4
 
+# Reference documents (large, not code)
+*.pdf
+
+# Raw tracking data (large, kept local-only rather than versioned)
+simulations/data/
+
 # OS
 .DS_Store
 Thumbs.db

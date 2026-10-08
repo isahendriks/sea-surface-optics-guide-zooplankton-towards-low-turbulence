@@ -1,0 +1,25 @@
+# Python 3.11. Install into a virtual environment at the repo root:
+#   py -3.11 -m venv .venv
+#   .venv\Scripts\python.exe -m pip install -r requirements.txt
+
+# Core numerics and plotting
+numpy==2.4.6
+pandas==3.0.6
+scipy==1.17.1
+matplotlib==3.11.2
+seaborn==0.13.2
+statsmodels==0.15.0
+
+# Trajectory Analysis: video loading and progress bars
+opencv-python==5.0.0.93
+imageio==2.38.0
+av==18.1.0
+tqdm==4.70.1
+
+# Running the "# %%" cells interactively (IPython.display is also imported by the simulations)
+ipython==9.17.1
+ipykernel==7.4.0
+
+# Optional: GPU acceleration for turbulence_model.create_velocity_field (falls back to NumPy without it).
+# Install the build matching your CUDA version, e.g.:
+# cupy-cuda12x

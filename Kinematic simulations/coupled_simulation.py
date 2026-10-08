@@ -8,10 +8,11 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 
 _THIS_DIR = Path(__file__).parent
 
+#%% Load functions from turbulence model and swimming model script
 def _load_functions(module_name, stop_before):
     """Import only the functions from the scripts without executing the rest of the code."""
     module_path = _THIS_DIR / module_name
-    source = module_path.read_text().split(stop_before)[0]
+    source = module_path.read_text(encoding="utf-8").split(stop_before)[0]
     ns = {"__file__": str(module_path)}  # so e.g. swimming_behavior's own __file__-relative paths resolve correctly
     exec(compile(source, module_name, 'exec'), ns)
     return ns
@@ -32,36 +33,35 @@ DELTA_T_MEAS = _sb['DELTA_T_MEAS']
 def couple_plankton(field_params, turning_kernel, initial_headings, tank_size, timesteps, fps,
                      N_plankton, set_turbulence=True, couple_orientation=True, dt_physics_target=0.01):
     """
-    Simulates plankton swimming through a turbulent flow via kinematic superposition
-    (Option A): the animal's swimming velocity, drawn from the empirical turning kernel
-    (unaffected by the flow), is simply added to the local turbulence velocity at the
-    animal's current position. This isolates the purely mechanical/advective effect of
-    turbulence on net progress.
-
-    On top of this, when couple_orientation=True, the heading also picks up a passive
-    reorientation from the local flow: a torque-free body embedded in a shear flow rotates at
-    half the local vorticity (the standard Jeffery/Faxen result), so dphi/dt = 0.5*vorticity is
-    added each physics substep, independent of and in addition to the animal's own voluntary
-    turning (dphi from the turning kernel, sampled once per behavioral_dt). This is what lets
-    turbulence disrupt orientation persistence -- rather than only advecting position -- since
-    a purely additive velocity coupling cannot bias net progress (the turbulence field is
-    zero-mean, so it only adds variance, not drift).
-
-    field_params: Fourier-mode coefficients from generate_field_params/create_velocity_field
-    turning_kernel, initial_headings: from load_behavior_parameters
-    timesteps, fps: fps controls how many positions get STORED (for output/animation) and is
-        independent of the turning kernel's decision cadence -- a new behavioral sample is
-        always drawn at the kernel's true native cadence (DELTA_T_MEAS), regardless of fps,
-        so raising or lowering fps changes trajectory resolution, not the underlying
-        turning-angle/speed statistics the kernel encodes.
-    set_turbulence: False runs the behavior-only control (no flow contribution at all)
-    couple_orientation: False reproduces the pure kinematic-superposition behavior (turbulence
-        only advects position, never affects heading); ignored when set_turbulence=False
-    dt_physics_target: turbulence advection is sub-stepped at (approximately) this timestep,
-        independent of both fps and the behavioral cadence, for accurate integration
+    Simulate the coupled movement of plankton in a tank, considering both their swimming behavior and the effects of turbulence.
+    
+    Important note: 
+        Make sure to run the scripts "turbulence_model.py" and "swimming_behavior.py" first with the parameters that are to be used. 
+        These scripts validate the turbuelence field and swimming behavior, and generate the necessary data for this simulation.    
+    Input parameters:
+        field_params: Fourier-mode coefficients from generate_field_params/create_velocity_field
+        turning_kernel, initial_headings: from load_behavior_parameters
+        timesteps, fps: fps controls how many positions get STORED (for output/animation) and is
+            independent of the turning kernel's decision cadence -- a new behavioral sample is
+            always drawn at the kernel's true native cadence (DELTA_T_MEAS), regardless of fps,
+            so raising or lowering fps changes trajectory resolution, not the underlying
+            turning-angle/speed statistics the kernel encodes.
+        set_turbulence: False runs the behavior-only control (no flow contribution at all)
+        couple_orientation: False reproduces the pure kinematic-superposition behavior (turbulence
+            only advects position, never affects heading); ignored when set_turbulence=False
+        dt_physics_target: turbulence advection is sub-stepped at (approximately) this timestep,
+            independent of both fps and the behavioral cadence, for accurate integration
+   
+    
+    Output:
+        stored_positions: numpy array of shape (N_plankton, 2, timesteps) with the x and y
+            positions of each plankton at each stored frame
+        T_end: the number of frames actually stored (may be less than timesteps if all plankton
+            have left the tank before the end of the simulation)
     """
+
     target_angle = np.pi / 2
-    output_dt = 1.0 / fps        # spacing between STORED frames
+    output_dt = 1.0 / fps # spacing between STORED frames
     behavioral_dt = DELTA_T_MEAS  # fixed: the kernel's true native decision cadence, independent of fps
 
     substeps_per_behavior = max(1, int(np.ceil(behavioral_dt / dt_physics_target)))
@@ -136,6 +136,7 @@ def couple_plankton(field_params, turning_kernel, initial_headings, tank_size, t
                     break
 
     T_end = output_idx
+
     return stored_positions, T_end
 
 def animate_plankton(stored_positions, T_end, tank_size, fps, N_plankton, epsilon_si, field_params, N_quiver=20, trail_length=20, gif_name=None):
@@ -143,13 +144,8 @@ def animate_plankton(stored_positions, T_end, tank_size, fps, N_plankton, epsilo
     Animates the stored plankton trajectories together with the turbulence velocity field and
     saves the result as a .gif. Mirrors swimming_behavior.py's animation (scatter of current
     positions + fading trails) combined with turbulence_model.py's quiver-plot animation.
-
-    field_params: Fourier-mode coefficients from generate_field_params (None for the epsilon=0
-        behavior-only control, in which case no quiver is drawn). Only evaluated on a coarse
-        N_quiver x N_quiver visualization grid -- unrelated to the fine dx_physics resolution
-        the physics itself is integrated at (see generate_field_params), so this stays cheap
-        regardless of epsilon.
     """
+
     frame_indices = np.arange(0, T_end, 1)  # Indices of frames to include in the animation
 
     fig, ax = plt.subplots(figsize=(6, 6))
@@ -221,7 +217,7 @@ def animate_plankton(stored_positions, T_end, tank_size, fps, N_plankton, epsilo
 
 #%% Simulate plankton movement through different turbulence levels
 
-measurement = "../data/Artemia_0805"  # which behavioral dataset (species/date) to use for the turning kernel
+measurement = "Artemia_0805"  # which behavioral dataset (species/date) in data/ to use for the turning kernel
 condition = "still"  # which experimental condition's trajectories to use: "still", "breeze", or "stormy"
 behavior = load_behavior_parameters(measurement, condition=condition)  # load_behavior_parameters builds "data/" + measurement itself
 turning_kernel = behavior["turning_kernel"]
@@ -270,11 +266,13 @@ for epsilon_si in epsilon_values:
             set_turbulence = True
             field_params = generate_field_params(epsilon, nu, N_modes, L)
 
+        # Run the actual simulation and couple the fields
         stored_positions, T_end = couple_plankton(
             field_params, turning_kernel, initial_headings, tank_size, timesteps, fps,
             N_plankton, set_turbulence=set_turbulence,
         )
 
+        # Calculate mean upward velocity, same parameter as used for the experimental data analysis
         mean_upward_velocity = np.nanmean(np.diff(stored_positions[:, 1, :T_end], axis=1) / delta_t)
 
         print(f"Mean upward velocity of plankton for epsilon = {epsilon_si:.1e}: {mean_upward_velocity:.4f} mm/s")
@@ -303,17 +301,15 @@ results = {
     "stored_positions_by_epsilon": stored_positions_by_epsilon,
 }
 
-measurement_name = Path(measurement).name  # e.g. "Artemia_0805" -- measurement itself carries a "../data/" prefix
-filename = f"plankton_turbulence_results_{measurement_name}_{condition}.pkl"
+measurement_name = Path(measurement).name  # e.g. "Artemia_0805"
+filename = Path(f"plankton_turbulence_results_{measurement_name}_{condition}.pkl")
 
+if filename.exists():
+    print(f"Warning: Overwriting existing results file {filename}.")
 with open(filename, "wb") as f:
-    if filename.exists():
-        print(f"Warning: Overwriting existing results file {filename}.")
     pickle.dump(results, f)
 
-#%%
-# epsilon=0 (no turbulence) can't sit on a log x-axis, so show it as a horizontal
-# reference band (control) instead of a point among the turbulent cases.
+#%% Plot mean upward velocity vs epsilon with error bars
 epsilon_arr = np.array(epsilon_values)
 mean_arr = np.array(mean_upward_velocities)
 std_arr = np.array(std_upward_velocities)

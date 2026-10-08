@@ -11,15 +11,42 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 
-# Generated simulation outputs (animations, videos)
+# Generated outputs (figures, animations, videos)
 *.gif
 *.mp4
+*.avi
+*.mov
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.svg
 
 # Reference documents (large, not code)
 *.pdf
 
-# Raw tracking data (large, kept local-only rather than versioned)
-simulations/data/
+# Data files -- all data is stored separately on OneDrive, not in this repo
+data/
+*.pkl
+*.pickle
+*.csv
+*.tsv
+*.txt
+*.mat
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.nc
+*.xlsx
+*.xls
+*.parquet
+*.feather
+*.xml
+
+# ...except the dependency list
+!requirements.txt
 
 # OS
 .DS_Store

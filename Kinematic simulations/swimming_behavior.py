@@ -9,27 +9,29 @@ from IPython.display import Image
 
 DELTA_T_MEAS = 0.1  # video frame interval of the tracking data [s] (10 fps)
 
-
+#%% Define functions for building and sampling the turning kernel
 def wrap_angle(a):
     """Wrap angle(s) to (-pi, pi]."""
     return (a + np.pi) % (2 * np.pi) - np.pi
 
-
-#%% Extract parameters from experimental data to set plankton parameters
-
 def build_turning_kernel(df, target_angle, n_bins=8, min_bin_samples=200):
-    """Empirical, deviation-conditioned turning-angle/speed kernel from real trajectories.
+    """
+    
+    Function to build a turning kernel from the measurement data, to later make a realisitc simulation of plankton swimming behavior.
 
-    For each bin of "current heading deviation from target_angle", stores the
-    (turning_angle, speed) pairs actually observed one frame later in that bin. Sampling
-    from this kernel reproduces the real turning-angle distribution (shape, persistence,
-    heavy tails), the real speed distribution, their correlation, and the (weak,
-    deviation-dependent) restoring bias toward target_angle - all directly from data,
-    with no parametric model (uniform-arc heading, Poisson reorientation, isotropic
-    diffusion) imposed on top.
+    Input:
+        df: pandas DataFrame with columns ["tank", "particle", "t", "speed", "orientation"]
+        target_angle: float, the target orientation angle (in radians) that plankton are expected to align with
+        n_bins: int, number of bins to divide the deviation from target_angle into
+        min_bin_samples: int, minimum number of samples required in a bin to use its empirical distribution; if fewer, use all samples instead
 
-    Bins with too few observed transitions (< min_bin_samples) fall back to the full,
-    unconditional pool of transitions so the kernel stays well-sampled everywhere.
+    Output:
+        A dictionary with keys:
+            "bin_edges": numpy array of bin edges for the deviation from target_angle
+            "kernel": list of tuples, where each tuple contains two numpy arrays:
+                (turning_angle_samples, speed_samples) for the corresponding bin
+
+
     """
     df = df.dropna(subset=["speed", "orientation"]).sort_values(["tank", "particle", "t"])
     g = df.groupby(["tank", "particle"])
@@ -61,6 +63,7 @@ def build_turning_kernel(df, target_angle, n_bins=8, min_bin_samples=200):
 def sample_turning_kernel(turning_kernel, phi, target_angle):
     """Draw one (turning_angle, speed) pair per heading in phi from the empirical kernel,
     conditioned on each heading's current deviation from target_angle."""
+
     bin_edges = turning_kernel["bin_edges"]
     kernel = turning_kernel["kernel"]
     n_bins = len(kernel)
@@ -85,16 +88,20 @@ def sample_turning_kernel(turning_kernel, phi, target_angle):
 
 def load_behavior_parameters(measurement="Artemia_0805", condition="still"):
     """
-    condition: which experimental condition's trajectories to build the turning kernel from,
-        e.g. "still" (default, no wind/wave stimulus), "breeze", or "stormy" -- selects
-        traj_{condition}_scaled.pkl within the measurement's data folder.
-    """
+    Function to load behavioral parameters from experimental data for plankton swimming simulations.
+
+    input:
+        measurement: which experimental measurement to load, e.g. "Artemia_0805
+        condition: which experimental condition's trajectories to build the turning kernel from,
+    
+    output:
+        A dictionary with keys:
+            "turning_kernel": the empirical turning kernel built from the measurement data
+            "initial_headings": numpy array of initial orientations of plankton in the measurement data
+   """
+
     ### Read the data from experiments
-    # data/ is shared across model variants (two_dim/, three_dim/, ...) and lives one level up
-    # from this file, so resolve it relative to this file's own location rather than the
-    # process's current working directory -- otherwise this only works by accident when
-    # launched from exactly the right directory.
-    data_directory = Path(__file__).parent.parent / "data" / measurement
+    data_directory = Path(__file__).parent / "data" / measurement
     path_to_traj = data_directory / f"traj_{condition}_scaled.pkl"
 
     df_traj = pd.read_pickle(path_to_traj)
@@ -102,8 +109,7 @@ def load_behavior_parameters(measurement="Artemia_0805", condition="still"):
 
     target_angle = np.pi / 2
 
-    # Empirical, deviation-conditioned (turning-angle, speed) kernel - see build_turning_kernel.
-    # This is what drives the simulation.
+    # Empirical, deviation-conditioned (turning-angle, speed) kernel
     turning_kernel = build_turning_kernel(df_traj, target_angle)
 
     print(f"turning kernel: {len(turning_kernel['kernel'])} bins, "
@@ -114,12 +120,12 @@ def load_behavior_parameters(measurement="Artemia_0805", condition="still"):
         "initial_headings": df_traj["orientation"].to_numpy(),
     }
 
-# %%
+# %% load behavioral parameters and set up simulation parameters
 measurement = "Artemia_0805"
 condition = "still"  # "still", "breeze", or "stormy"
-path_to_measurement = Path("data") / measurement
-behavioral_params = load_behavior_parameters(measurement=path_to_measurement, condition=condition)
+behavioral_params = load_behavior_parameters(measurement=measurement, condition=condition)  # resolves data/<measurement> itself
 
+### Simulation parameters
 tank_size = 90  # mm
 T_sim = 120
 fps = 10
@@ -142,8 +148,7 @@ target_angle = np.pi / 2
 # Store the positions
 stored_positions = np.zeros((N_plankton, 2, timesteps))
 
-# Initialize plankton positions uniformly, and headings by bootstrapping real observed
-# orientations - a realistic starting distribution rather than an arbitrary arc/uniform draw
+# Initialize plankton positions uniformly and headings by bootstrapping measurement data
 x_pos = np.random.uniform(0, tank_size, N_plankton)
 y_pos = np.random.uniform(0, tank_size, N_plankton)
 phi = np.random.choice(behavioral_params["initial_headings"], size=N_plankton, replace=True)
@@ -159,8 +164,7 @@ for t in range(timesteps):
         T_end = t
         break
 
-    # Draw a real (turning_angle, speed) transition per plankton from the empirical kernel,
-    # conditioned on each plankton's current deviation from target_angle
+    # Draw a real (turning_angle, speed) transition per plankton from the empirical kernel
     dphi, speed = sample_turning_kernel(turning_kernel, phi, target_angle)
     phi = wrap_angle(phi + dphi)
 

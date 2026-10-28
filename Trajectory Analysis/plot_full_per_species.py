@@ -21,8 +21,6 @@ from post_processing_functions import *
 import pickle
 from scipy.stats import gaussian_kde
 
-
-
 # Create a single A4-sized Figure and a 1x9 grid with small spacing
 mm_to_inch = lambda mm: mm / 25.4
 A4_W_MM = 210.0

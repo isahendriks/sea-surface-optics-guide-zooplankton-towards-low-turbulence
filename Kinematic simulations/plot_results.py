@@ -101,7 +101,7 @@ color_still, color_breeze, color_stormy = '#94c4df', '#4a98c9', '#1764ab'
 
 #%% Plot all three conditions in one figure for comparison
 
-measurement = "../data/Artemia_0805"  # change this to the species folder you want to plot
+measurement = "Artemia_0805"  # change this to the species folder you want to plot
 measurement_name = Path(measurement).name  # used by the plotting cells below
 
 df_still = pickle.load(open(f"plankton_turbulence_results_{measurement_name}_still.pkl", "rb"))
@@ -196,7 +196,7 @@ for m in measurements:
 # Mean swim speed U per species x condition, used for the swimming number Phi = U / u_eta, where
 # u_eta = (epsilon * nu)^(1/4) is the Kolmogorov velocity. U is the mean speed of that species'
 # tracked trajectories in that condition (the same 'speed' data the turning kernel is built from).
-DATA_DIR = Path("../data")  # shared trajectory data, relative to this script's folder (see swimming_behavior.py)
+DATA_DIR = Path(__file__).parent / "data"  # experimental trajectory data, data/<species>/ next to this script (as in swimming_behavior.py)
 NU_SI = 1e-6                # kinematic viscosity [m^2/s], same value the simulations use
 
 def kolmogorov_velocity_mm_s(epsilon_si):

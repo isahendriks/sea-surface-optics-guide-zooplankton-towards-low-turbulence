@@ -24,42 +24,12 @@ _sb = _load_functions('swimming_behavior.py', '# %% load behavioral parameters a
 generate_field_params = _tm['generate_field_params']
 velocity_at = _tm['velocity_at']
 vorticity_at = _tm['vorticity_at']
-# turbulence_model.py no longer has the GPU/batched helpers; only the unused couple_plankton_batch needs this
-_array_module = _tm.get('_array_module', lambda a: np)
 load_behavior_parameters = _sb['load_behavior_parameters']
 sample_turning_kernel = _sb['sample_turning_kernel']
 wrap_angle = _sb['wrap_angle']
 DELTA_T_MEAS = _sb['DELTA_T_MEAS']
 
-# GPU (CuPy) support is opt-in and auto-detected: if cupy is installed and a GPU is visible,
-# couple_plankton_batch can run its substep physics on it (see USE_GPU below); otherwise this
-# quietly stays on NumPy/CPU, exactly like create_velocity_field's existing fallback in
-# turbulence_model.py. Not installed/tested in this environment as of writing this -- see the
-# chat writeup for how to verify it once cupy is installed.
-try:
-    import cupy as _cupy
-    _ = _cupy.cuda.runtime.getDeviceCount()  # raises if no GPU is actually visible
-    GPU_AVAILABLE = True
-except Exception:
-    _cupy = None
-    GPU_AVAILABLE = False
-
-def _drop_nan_epsilon(epsilon_arr, mean_arr, std_arr, label=""):
-    """
-    Drops any epsilon values whose mean is NaN before plotting (e.g. from generate_field_params
-    raising/skipping at eta>=L, or any other trial-level failure that left a whole epsilon's
-    trials NaN -- see the eta>=L guard in turbulence_model.py and the completed Artemia results,
-    which silently carried a NaN row at epsilon=1e-14 before that guard existed). Without this,
-    a NaN point breaks plt.scatter (silently omits just that point, harmless) but can also
-    distort fill_between's shaded band with a visible gap/artifact and skews axis autoscaling.
-    Prints which epsilon values were dropped so it's visible, not silent.
-    """
-    epsilon_arr, mean_arr, std_arr = np.asarray(epsilon_arr), np.asarray(mean_arr), np.asarray(std_arr)
-    bad = np.isnan(mean_arr)
-    if bad.any():
-        print(f"Note: dropping {bad.sum()} NaN epsilon value(s) from {label or 'plot'}: {epsilon_arr[bad]}")
-    return epsilon_arr[~bad], mean_arr[~bad], std_arr[~bad]
-
+# function to format the elapsed time and ETA for progress printouts
 def _format_duration(seconds):
     """Formats a duration in seconds as e.g. '2h 14m', '3m 05s', or '42s', for progress/ETA printouts."""
     seconds = max(0, int(seconds))
@@ -73,8 +43,7 @@ def _format_duration(seconds):
 
 #%% Trajectory statistics, computed exactly as in Trajectory Analysis/load_and_save.py
 
-# Same thresholds as Trajectory Analysis/load_and_save.py, so simulated and measured values are
-# directly comparable. One simulated trial plays the role of one experimental tank.
+# Same thresholds as Trajectory Analysis/load_and_save.py, so simulated and measured values are directly comparable. One simulated trial plays the role of one experimental tank.
 ARTIFACT_THRESHOLD = 0.0001  # [mm] steps with |dx| or |dy| below this are dropped
 MIN_MOVEMENT = 0.3  # [mm] trajectories with a smaller net (start-to-end) displacement are stationary
 MIN_FRAMES = 30  # trajectories with fewer frames are dropped
@@ -154,15 +123,7 @@ def couple_plankton(field_params, turning_kernel, initial_headings, tank_size, t
                      N_plankton, set_turbulence=True, couple_orientation=True, dt_physics_target=0.01,
                      progress_label="", progress_interval=0.5):
     """
-    Simulate the coupled movement of plankton in a tank, considering both their swimming behavior and the effects of turbulence.
-
-    The animal's swimming velocity, drawn from the empirical turning kernel, is added to the local
-    turbulence velocity at its position (kinematic superposition). When couple_orientation=True,
-    the heading is also rotated by the local flow at half the local vorticity (the standard
-    Jeffery/Faxen result for a torque-free body), dphi/dt = 0.5*vorticity, each physics substep,
-    in addition to the animal's own turning (sampled from the kernel once per behavioral_dt). This
-    is what lets turbulence disrupt orientation persistence rather than only advecting position:
-    the turbulence field is zero-mean, so the velocity coupling alone adds variance, not drift.
+    Couple the simulated swimming behavior of plankton with the turbulence velocity field, and return the stored positions of the plankton over time.
 
     Important note:
         Make sure to run the scripts "turbulence_model.py" and "swimming_behavior.py" first with the parameters that are to be used.
@@ -201,18 +162,12 @@ def couple_plankton(field_params, turning_kernel, initial_headings, tank_size, t
 
     stored_positions = np.zeros((N_plankton, 2, timesteps))
 
-    # float32 throughout, matching field_params' dtype (see generate_field_params): mixing
-    # float64 position/heading arrays with float32 k_n/A_n/B_n silently upcasts every phase/
-    # cos/sin/matmul in the hot substep loop to float64 -- measured ~5.75x slower for no
-    # accuracy benefit (positions/headings have nowhere near float64 precision requirements
-    # here). np.random.uniform/np.random.choice both default to float64, so this needs an
-    # explicit cast; everything derived from x_pos/y_pos/phi thereafter stays float32 under
-    # numpy's normal float32-arrayop-python-float-scalar promotion rules (NEP 50, numpy>=2.0).
+    # float32 throughout, matching field_params' dtype (see generate_field_params)
     x_pos = np.random.uniform(0, tank_size, N_plankton).astype(np.float32)
     y_pos = np.random.uniform(0, tank_size, N_plankton).astype(np.float32)
     phi = np.random.choice(initial_headings, size=N_plankton, replace=True).astype(np.float32)
 
-    # +1 as a rounding safety margin so we never run short of the last requested output frame
+    # +1 as a rounding safety margin to avoid storing fewer frames than requested when output_dt is not an integer multiple of behavioral_dt
     n_behavior_frames = int(np.ceil(timesteps * output_dt / behavioral_dt)) + 1
     output_idx = 0
     physics_step = 0
@@ -232,17 +187,13 @@ def couple_plankton(field_params, turning_kernel, initial_headings, tank_size, t
             print(f"\r{prefix}frame {output_idx}/{timesteps} ({pct:4.1f}%) ...", end='', flush=True)
             last_progress_print = now
 
-        # One behavioral decision per true DELTA_T_MEAS interval, regardless of fps -- the
-        # animal's intended swim is independent of the flow (that's the Option A assumption).
-        # dphi/speed come from the real (float64) trajectory data via sample_turning_kernel, so
-        # need the same explicit float32 cast as x_pos/y_pos/phi above.
+        # Sample the turning kernel once per true DELTA_T_MEAS interval, for all plankton at once
         dphi, speed = sample_turning_kernel(turning_kernel, phi, target_angle)
         dphi = dphi.astype(np.float32, copy=False)
         speed = speed.astype(np.float32, copy=False)
         phi = wrap_angle(phi + dphi)
 
-        # Sub-step turbulence advection within this behavioral interval for accurate
-        # integration, independent of fps (mirrors the fix in turbulence_model.py's particle loop).
+        # Sub-step turbulence advection within this behavioral interval for accurate integration, independent of fps
         for sub in range(substeps_per_behavior):
             if set_turbulence:
                 t_phys = physics_step * dt_physics
@@ -284,139 +235,6 @@ def couple_plankton(field_params, turning_kernel, initial_headings, tank_size, t
 
     T_end = output_idx
 
-    return stored_positions, T_end
-
-def couple_plankton_batch(field_params_batch, turning_kernel, initial_headings, tank_size, timesteps, fps,
-                           N_plankton, N_trials, set_turbulence=True, couple_orientation=True,
-                           dt_physics_target=0.01, progress_label="", progress_interval=0.5):
-    """
-    Vectorized version of couple_plankton: runs N_trials independent trials at once instead of
-    looping over them one at a time. Each trial gets its own turbulence-field realization (from
-    field_params_batch = generate_field_params(..., T=N_trials)) and its own independent
-    plankton, but all trials are advanced together as one batched (N_trials, N_plankton, ...)
-    array through velocity_at/vorticity_at, which understand the extra leading trial axis (see
-    turbulence_model.py's docstrings).
-
-    MEASURED ON CPU: this is currently ~1.7-2x SLOWER than N_trials serial couple_plankton
-    calls, not faster -- numpy's matmul for stacked (T, M, N) arrays isn't a single fused BLAS
-    call, it loops internally over the T slices anyway, and the larger intermediate arrays this
-    creates measured out slower than the equivalent tight loop of small 2D matmuls (isolated,
-    reproducible microbenchmark; not explained by BLAS threading -- same result with
-    OPENBLAS_NUM_THREADS=1). So on CPU, prefer plain couple_plankton in a loop; this function is
-    NOT wired into the main run below. It's kept because a real GPU backend (cupy's matmul on
-    3D arrays can dispatch to a genuinely fused batched GEMM, cublasgemmStridedBatched, unlike
-    numpy) might invert this -- but that's unverified: no cupy install was available to test
-    against in this environment. If you install cupy and try it, benchmark before trusting it
-    for a real run (see chat writeup for a suggested comparison).
-
-    If field_params_batch's arrays live on a GPU (built by passing generate_field_params's
-    output through cupy.asarray), the substep physics -- velocity_at/vorticity_at and the
-    position/heading updates -- runs on that GPU too, dispatched automatically via
-    _array_module. Only the once-per-behavioral-frame turning-kernel sampling (sample_
-    turning_kernel, which uses numpy-only helpers: np.digitize etc.) round-trips through the
-    host; that happens n_behavior_frames times total (not per substep), so the transfer cost is
-    likely negligible next to what staying on GPU for the substep loop would save -- again,
-    unverified here.
-
-    Returns stored_positions with shape (N_trials, N_plankton, 2, timesteps) and T_end, exactly
-    like couple_plankton but with the extra leading trials axis (always a plain NumPy array,
-    even when the physics ran on GPU, since this is the output that gets pickled/plotted).
-    """
-    target_angle = np.pi / 2
-    output_dt = 1.0 / fps
-    behavioral_dt = DELTA_T_MEAS
-
-    substeps_per_behavior = max(1, int(np.ceil(behavioral_dt / dt_physics_target)))
-    dt_physics = behavioral_dt / substeps_per_behavior
-    physics_steps_per_output = max(1, round(output_dt / dt_physics))
-
-    xp = _array_module(field_params_batch["k_n"]) if set_turbulence else np
-    is_gpu = xp is not np
-
-    def to_numpy(a):
-        return a.get() if is_gpu else a
-
-    stored_positions = np.zeros((N_trials, N_plankton, 2, timesteps))  # host: this is the
-    # output being accumulated and later pickled/plotted, not part of the hot substep loop, so
-    # there's no benefit to keeping it device-resident throughout.
-
-    # float32 throughout, matching field_params_batch's dtype -- see the same note in
-    # couple_plankton; mixing float64 positions with float32 field params silently upcasts
-    # every phase/cos/sin/matmul in the hot substep loop to float64 (measured ~5.75x slower).
-    x_pos = xp.asarray(np.random.uniform(0, tank_size, (N_trials, N_plankton)).astype(np.float32))
-    y_pos = xp.asarray(np.random.uniform(0, tank_size, (N_trials, N_plankton)).astype(np.float32))
-    # phi is drawn on the host (sample_turning_kernel below is numpy-only) then moved to xp for
-    # the substep loop, where it also picks up the (device-resident) vorticity nudge each step.
-    phi = xp.asarray(np.random.choice(initial_headings, size=(N_trials, N_plankton), replace=True).astype(np.float32))
-
-    n_behavior_frames = int(np.ceil(timesteps * output_dt / behavioral_dt)) + 1
-    output_idx = 0
-    physics_step = 0
-    last_progress_print = 0.0
-    prefix = f"{progress_label} " if progress_label else ""
-
-    for b in range(n_behavior_frames):
-        if output_idx >= timesteps:
-            break
-        if bool(xp.isnan(x_pos).all()):
-            print(f"\n{prefix}All plankton (all {N_trials} trials) have left the simulation "
-                  f"domain at output frame {output_idx}. Ending simulation.")
-            break
-
-        now = time.time()
-        if now - last_progress_print >= progress_interval or output_idx >= timesteps - 1:
-            pct = 100 * output_idx / timesteps if timesteps else 100
-            print(f"\r{prefix}frame {output_idx}/{timesteps} ({pct:4.1f}%) ...", end='', flush=True)
-            last_progress_print = now
-
-        # One behavioral decision per true DELTA_T_MEAS interval, for ALL trials/plankton at
-        # once: sample_turning_kernel is elementwise/shape-agnostic (see swimming_behavior.py),
-        # so it accepts the full (N_trials, N_plankton) heading array directly -- itself already
-        # an N_trials-fold reduction in Python-level calls versus looping trials serially.
-        dphi, speed_host = sample_turning_kernel(turning_kernel, to_numpy(phi), target_angle)
-        phi = wrap_angle(phi + xp.asarray(dphi))
-        speed = xp.asarray(speed_host)
-
-        # Sub-step turbulence advection within this behavioral interval for accurate
-        # integration, independent of fps (mirrors couple_plankton / turbulence_model.py).
-        for sub in range(substeps_per_behavior):
-            if set_turbulence:
-                t_phys = physics_step * dt_physics
-                positions = xp.stack([x_pos, y_pos], axis=-1)
-                vx_turb, vy_turb = velocity_at(field_params_batch, positions, t_phys)
-
-                if couple_orientation:
-                    omega_local = vorticity_at(field_params_batch, positions, t_phys)
-                    phi = wrap_angle(phi + 0.5 * omega_local * dt_physics)
-            else:
-                vx_turb = vy_turb = 0.0
-
-            vx_behav = speed * xp.cos(phi)
-            vy_behav = speed * xp.sin(phi)
-
-            # Kinematic superposition: swim velocity + ambient flow velocity
-            x_pos = x_pos + (vx_behav + vx_turb) * dt_physics
-            y_pos = y_pos + (vy_behav + vy_turb) * dt_physics
-
-            # reflect at the sides
-            x_pos[x_pos > tank_size] = 2 * tank_size - x_pos[x_pos > tank_size]
-            x_pos[x_pos < 0] = -x_pos[x_pos < 0]
-
-            # leave the simulation at top and bottom - drop both coordinates together so a
-            # departed plankton stops being updated (and reoriented) afterward
-            left_domain = (y_pos > tank_size) | (y_pos < 0)
-            x_pos[left_domain] = np.nan
-            y_pos[left_domain] = np.nan
-
-            physics_step += 1
-            if output_idx < timesteps and physics_step % physics_steps_per_output == 0:
-                stored_positions[:, :, 0, output_idx] = to_numpy(x_pos)
-                stored_positions[:, :, 1, output_idx] = to_numpy(y_pos)
-                output_idx += 1
-                if output_idx >= timesteps:
-                    break
-
-    T_end = output_idx
     return stored_positions, T_end
 
 def animate_plankton(stored_positions, T_end, tank_size, fps, N_plankton, epsilon_si, field_params, N_quiver=20, trail_length=20, gif_name=None):
@@ -495,7 +313,7 @@ def animate_plankton(stored_positions, T_end, tank_size, fps, N_plankton, epsilo
 
     print(f"\nAnimation saved as {gif_name if gif_name is not None else gif_path}.")
 
-#%% Set the parameters for the simulation and run it
+#%% Set the parameters for single simulation run (one species/condition/epsilon/trial) and run it
 
 measurement = "BarnacleLarvae_2102"  # which behavioral dataset (species/date) in data/ to use for the turning kernel
 
@@ -505,7 +323,7 @@ fps = 10 # temporal resolution [fps]
 t_simulation = 120 # total length of simulation [s]
 
 ### Parameters for velocity field (in SI units * 1e6 to convert to mm)
-nu_si = 1e-6 # Kinematic viscosity of sea water depends on salinity and temperature. Ranges from 1e-6 to 1.8e-6, times 1e-6 to convert to mm
+nu_si = 1e-6 # Kinematic viscosity [m^2/s]; sea water ranges ~1e-6 to 1.8e-6 m^2/s. Multiplied by 1e6 below to get mm^2/s
 N_modes = 500 # Total number of wave numbers sampled
 
 L = 90   # Maximum length scale of turbulence [mm]
@@ -616,7 +434,7 @@ if filename.exists():
 with open(filename, "wb") as f:
     pickle.dump(results, f)
 
-#%% Function: run every epsilon x trial for the given conditions of one species, save one results file per condition
+#%% Function: run every epsilon N trials for each condition and save results per condition
 def run_and_save_conditions(measurement, conditions, progress=None):
     """
     Runs N_trials simulations per epsilon in epsilon_values for each condition in `conditions`,
@@ -650,12 +468,14 @@ def run_and_save_conditions(measurement, conditions, progress=None):
 
         for e_idx, epsilon_si in enumerate(epsilon_values):
             mean_upward_velocity_trials = []
-            for trial in range(N_trials):  # run multiple trials for each epsilon to average out stochasticity
+
+            for trial in range(N_trials):  
                 elapsed = time.time() - progress["start"]
                 overall_frac = progress["done"] / progress["total"] if progress["total"] else 0
                 eta_str = _format_duration(elapsed / overall_frac - elapsed) if overall_frac > 0 else "…"
                 label = (f"[{measurement_name} {condition} {c_idx + 1}/{len(conditions)} | eps {e_idx + 1}/{len(epsilon_values)}="
                          f"{epsilon_si:.1e} | trial {trial + 1}/{N_trials}]")
+                
                 print(f"\n{label} overall {overall_frac * 100:4.1f}% "
                       f"(elapsed {_format_duration(elapsed)}, ETA {eta_str})")
 
@@ -671,10 +491,7 @@ def run_and_save_conditions(measurement, conditions, progress=None):
                     set_turbulence = True
                     field_params = generate_field_params(epsilon, nu, N_modes, L)
 
-                stored_positions, T_end = couple_plankton(
-                    field_params, turning_kernel, initial_headings, tank_size, timesteps, fps,
-                    N_plankton, set_turbulence=set_turbulence, progress_label=label,
-                )
+                stored_positions, T_end = couple_plankton(field_params, turning_kernel, initial_headings, tank_size, timesteps, fps, N_plankton, set_turbulence=set_turbulence, progress_label=label)
 
                 stats = trajectory_statistics(stored_positions, T_end, fps)
                 mean_upward_velocity = stats["mean_upward_velocity"]
@@ -734,127 +551,15 @@ def run_and_save_conditions(measurement, conditions, progress=None):
 
     return progress
 
-#%% Run through all three conditions (still, breeze, stormy) for `measurement` and save results for each
-conditions = ["still", "breeze", "stormy"]
-run_and_save_conditions(measurement, conditions)
-measurement_name = Path(measurement).name  # used by the plotting cells below
+#%% Rerun ALL simulations
 
-#%% Rerun ALL simulations: every species x condition (overwrites every existing results file)
-# Takes long -- roughly 1.5 h per species x condition on this machine (as of the last runs), so
-# ~13-15 h for all nine. Progress/ETA printouts cover the whole run. Edit the lists to rerun a subset.
 all_measurements = ["Artemia_0805", "Cladocerans_2605", "BarnacleLarvae_2102"]
 all_conditions = ["still", "breeze", "stormy"]
 
 progress = {"start": time.time(), "total": len(all_measurements) * len(all_conditions) * len(epsilon_values) * N_trials, "done": 0}
+
 for m_idx, m in enumerate(all_measurements):
     print(f"\n##### Species {m_idx + 1}/{len(all_measurements)}: {Path(m).name} #####")
     run_and_save_conditions(m, all_conditions, progress)
+
 print(f"\nAll simulations done in {_format_duration(time.time() - progress['start'])}.")
-
-#%% Plot mean upward velocity vs epsilon with error bars
-# epsilon=0 (no turbulence) can't sit on a log x-axis, so show it as a horizontal
-# reference band (control) instead of a point among the turbulent cases.
-epsilon_arr = np.array(epsilon_values)
-mean_arr = np.array(mean_upward_velocities)
-std_arr = np.array(std_upward_velocities)
-
-is_control = epsilon_arr == 0
-eps_turb, mean_turb, std_turb = epsilon_arr[~is_control], mean_arr[~is_control], std_arr[~is_control]
-eps_turb, mean_turb, std_turb = _drop_nan_epsilon(eps_turb, mean_turb, std_turb, label="single-condition plot")
-
-fig, ax = plt.subplots(figsize=(6, 5))
-
-if is_control.any():
-    control_mean, control_std = mean_arr[is_control][0], std_arr[is_control][0]
-    ax.axhline(control_mean, color='gray', linestyle='--', label='No turbulence (control)')
-    ax.axhspan(control_mean - control_std, control_mean + control_std, color='gray', alpha=0.15)
-
-ax.errorbar(eps_turb, mean_turb, yerr=std_turb, fmt='o', capsize=5, color='C0', label='With turbulence')
-ax.set_xscale('log')
-ax.set_xlabel('Dissipation rate, epsilon [m^2/s^3]')
-
-ax.set_ylabel('Mean upward velocity of plankton [mm/s]')
-ax.set_title('Effect of turbulence intensity on net upward swimming speed')
-ax.legend()
-
-ax.grid(True, linestyle='--', alpha=0.7)
-fig.tight_layout()
-fig.savefig('upward_velocity_vs_epsilon.png', dpi=150)
-plt.show()
-
-#%% Plot all three conditions in one figure for comparison
-df_still = pickle.load(open(f"plankton_turbulence_results_{measurement_name}_still.pkl", "rb"))
-df_breeze = pickle.load(open(f"plankton_turbulence_results_{measurement_name}_breeze.pkl", "rb"))
-df_stormy = pickle.load(open(f"plankton_turbulence_results_{measurement_name}_stormy.pkl", "rb"))
-
-epsilon_arr_still = np.array(df_still["epsilon_values"])
-epsilon_arr_breeze = np.array(df_breeze["epsilon_values"])
-epsilon_arr_stormy = np.array(df_stormy["epsilon_values"])
-
-mean_still = np.array(df_still["mean_upward_velocities"])
-mean_breeze = np.array(df_breeze["mean_upward_velocities"])
-mean_stormy = np.array(df_stormy["mean_upward_velocities"])
-
-std_still = np.array(df_still["std_upward_velocities"])
-std_breeze = np.array(df_breeze["std_upward_velocities"])
-std_stormy = np.array(df_stormy["std_upward_velocities"])
-
-control_still = mean_still[0]
-control_breeze = mean_breeze[0]
-control_stormy = mean_stormy[0]
-
-#%%
-from matplotlib.lines import Line2D
-
-fig, ax = plt.subplots(figsize=(6, 5))
-
-# Drop any NaN epsilon values (e.g. epsilon=1e-14 in the completed Artemia results -- see
-# turbulence_model.py's eta>=L guard) before plotting, per condition.
-eps_still_plot, mean_still_plot, std_still_plot = _drop_nan_epsilon(epsilon_arr_still[1:], mean_still[1:], std_still[1:], label="still")
-eps_breeze_plot, mean_breeze_plot, std_breeze_plot = _drop_nan_epsilon(epsilon_arr_breeze[1:], mean_breeze[1:], std_breeze[1:], label="breeze")
-eps_stormy_plot, mean_stormy_plot, std_stormy_plot = _drop_nan_epsilon(epsilon_arr_stormy[1:], mean_stormy[1:], std_stormy[1:], label="stormy")
-
-# Plot the mean upward velocities with a shaded +/- 1 std band for each condition
-# (no per-call labels: color and line-style are explained by two separate legends below)
-ax.plot(eps_still_plot, mean_still_plot, 'o-', color='C0')
-ax.fill_between(eps_still_plot, mean_still_plot - std_still_plot, mean_still_plot + std_still_plot, color='C0', alpha=0.2)
-
-ax.plot(eps_breeze_plot, mean_breeze_plot, 'o-', color='C1')
-ax.fill_between(eps_breeze_plot, mean_breeze_plot - std_breeze_plot, mean_breeze_plot + std_breeze_plot, color='C1', alpha=0.2)
-
-ax.plot(eps_stormy_plot, mean_stormy_plot, 'o-', color='C2')
-ax.fill_between(eps_stormy_plot, mean_stormy_plot - std_stormy_plot, mean_stormy_plot + std_stormy_plot, color='C2', alpha=0.2)
-
-# Plot control bands for each condition
-ax.axhline(control_still, color='C0', linestyle='--')
-ax.axhspan(control_still - std_still[0], control_still + std_still[0], color='C0', alpha=0.15)
-ax.axhline(control_breeze, color='C1', linestyle='--')
-ax.axhspan(control_breeze - std_breeze[0], control_breeze + std_breeze[0], color='C1', alpha=0.15)
-ax.axhline(control_stormy, color='C2', linestyle='--')
-ax.axhspan(control_stormy - std_stormy[0], control_stormy + std_stormy[0], color='C2', alpha=0.15)
-
-ax.set_xscale('log')
-ax.set_xlabel('Dissipation rate, epsilon [m^2/s^3]')
-ax.set_ylabel('Mean upward velocity of plankton [mm/s]')
-ax.grid(True, linestyle='--', alpha=0.7)
-ax.set_title('Effect of turbulence on mean vertical swimming speed')
-
-# Two separate legends, proxy handles: one for color (condition), one for line style (with vs
-# without turbulence) -- ax.add_artist keeps the first legend when the second legend() is added.
-color_handles = [
-    Line2D([0], [0], marker='o', color='C0', label='Still'),
-    Line2D([0], [0], marker='o', color='C1', label='Breeze'),
-    Line2D([0], [0], marker='o', color='C2', label='Stormy'),
-]
-style_handles = [
-    Line2D([0], [0], marker='o', color='gray', linestyle='-', label='With turbulence'),
-    Line2D([0], [0], color='gray', linestyle='--', label='No turbulence (control)'),
-]
-color_legend = ax.legend(handles=color_handles, title='Condition', loc='upper left')
-ax.add_artist(color_legend)
-ax.legend(handles=style_handles, title='Line style', loc='lower right')
-
-fig.tight_layout()
-fig.savefig(f'upward_velocity_vs_epsilon_all_conditions_{measurement_name}.png', dpi=150)
-
-# %%

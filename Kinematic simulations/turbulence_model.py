@@ -87,55 +87,34 @@ def create_velocity_field(epsilon, nu, N, L, grid_size, tank_size, timesteps, fp
             timesteps: Number of time steps
             fps: Frames per second
 
-    Runs on GPU via CuPy when it's installed and a GPU is visible, otherwise transparently
-    falls back to NumPy on CPU
-
     """
     field_params = generate_field_params(epsilon, nu, N, L)
     k_n, A_n, B_n, omega_n = field_params["k_n"], field_params["A_n"], field_params["B_n"], field_params["omega_n"]
 
-    try:
-        import cupy as xp
-        _ = xp.cuda.runtime.getDeviceCount()  # raises if no GPU is actually visible
-        _gpu = True
-    except Exception:
-        xp = np
-        _gpu = False
-    print(f"\r create_velocity_field: using {'GPU (CuPy)' if _gpu else 'CPU (NumPy)'}" + " " * 20)
-
-    def to_numpy(a):
-        return a.get() if _gpu else a
-
     ### Define the parameters for the spatial grid
-    x = xp.linspace(0, tank_size, grid_size, dtype=xp.float32)
-    y = xp.linspace(0, tank_size, grid_size, dtype=xp.float32)
-    X, Y = xp.meshgrid(x, y)
-
-    # Move the (small) Fourier-mode arrays onto the compute device (no-op if xp is NumPy)
-    A_n_dev = xp.asarray(A_n)
-    B_n_dev = xp.asarray(B_n)
-    k_n_dev = xp.asarray(k_n)
-    omega_n_dev = xp.asarray(omega_n)
+    x = np.linspace(0, tank_size, grid_size, dtype=np.float32)
+    y = np.linspace(0, tank_size, grid_size, dtype=np.float32)
+    X, Y = np.meshgrid(x, y)
 
     # Define the spatial grid (x, y)
-    positions = xp.stack([X.ravel(), Y.ravel()], axis=-1)  # Flattened grid positions for efficiency (Shape: (grid_size * grid_size, 2))
+    positions = np.stack([X.ravel(), Y.ravel()], axis=-1)  # Flattened grid positions for efficiency (Shape: (grid_size * grid_size, 2))
 
     # Spatial part of the phase doesn't depend on t, so compute it once instead of every timestep
-    spatial_phase = positions @ k_n_dev.T  # (grid_size^2, N)
+    spatial_phase = positions @ k_n.T  # (grid_size^2, N)
 
     # Initialize an array to store the velocity field at each time step
-    velocity_field = xp.zeros((timesteps, grid_size, grid_size, 2), dtype=xp.float32)
+    velocity_field = np.zeros((timesteps, grid_size, grid_size, 2), dtype=np.float32)
 
-    # Compute the velocity field for each time step. 
+    # Compute the velocity field for each time step.
     for t in range(timesteps):
         print(f"\r Simulating velocity field for timestep {t}/{timesteps} ...", end='\r', flush=True)
-        phase = spatial_phase + omega_n_dev[None, :] * xp.float32(t / fps)  # (grid_size^2, N)
-        u = xp.cos(phase) @ A_n_dev + xp.sin(phase) @ B_n_dev                # (grid_size^2, 2)
+        phase = spatial_phase + omega_n[None, :] * np.float32(t / fps)  # (grid_size^2, N)
+        u = np.cos(phase) @ A_n + np.sin(phase) @ B_n                   # (grid_size^2, 2)
 
         velocity_field[t, ..., 0] = u[:, 0].reshape(grid_size, grid_size)  # x-component
         velocity_field[t, ..., 1] = u[:, 1].reshape(grid_size, grid_size)  # y-component
 
-    return to_numpy(velocity_field), field_params
+    return velocity_field, field_params
 
 def velocity_at(field_params, positions, t):
     # positions: (M, 2) array of (x, y); t: time in seconds
@@ -158,7 +137,7 @@ def vorticity_at(field_params, positions, t):
 
     return np.sin(phase) @ alpha_n + np.cos(phase) @ beta_n
 
-def epsilon_from_weather(wind_speed_ms, sig_wave_height_m, z_m, rho_air=1.225, rho_water=1025.0, kappa=0.4):
+def epsilon_from_weather(wind_speed_ms, sig_wave_height_m, z_m):
     """
     Estimates near-surface turbulent kinetic energy dissipation rate epsilon [m^2/s^3] from
     10m wind speed and significant wave height, using the Terray et al. (1996) wave-enhanced
@@ -173,6 +152,11 @@ def epsilon_from_weather(wind_speed_ms, sig_wave_height_m, z_m, rho_air=1.225, r
     output: 
         epsilon: estimated dissipation rate [m^2/s^3]
     """
+    rho_air=1.225 # Air density [kg/m^3]
+    rho_water=1025.0 # Water density [kg/m^3]
+    kappa=0.4 # Von Karman constant
+    alpha = 0.3  # Terray et al. (1996) normalization constant 
+
     wind_speed_ms = np.asarray(wind_speed_ms, dtype=float)
     sig_wave_height_m = np.asarray(sig_wave_height_m, dtype=float)
 
@@ -182,13 +166,61 @@ def epsilon_from_weather(wind_speed_ms, sig_wave_height_m, z_m, rho_air=1.225, r
     u_star_air = np.sqrt(Cd) * wind_speed_ms
     u_star_water = u_star_air * np.sqrt(rho_air / rho_water)  # stress continuity across the interface
 
-    alpha = 0.3  # Terray et al. (1996) normalization constant 
+
     transition_depth = 0.6 * sig_wave_height_m
 
     epsilon_wave_layer = alpha * u_star_water**3 / sig_wave_height_m
     epsilon_log_layer = u_star_water**3 / (kappa * z_m)
 
     return np.where(z_m <= transition_depth, epsilon_wave_layer, epsilon_log_layer)
+
+def weather_from_epsilon(epsilon, z_m):
+    """
+    Estimates the 10m wind speed and significant wave height from near-surface turbulent kinetic energy dissipation rate epsilon [m^2/s^3], using the Terray et al. (1996) wave-enhanced surface-layer result.
+
+    input: 
+        epsilon: estimated dissipation rate [m^2/s^3]
+        z_m: depth below the surface to evaluate epsilon at [m]
+        
+    output: 
+        wind_speed_ms: 10m wind speed [m/s]
+        sig_wave_height_m: significant wave height Hs [m]
+    """
+    # This is a simplified inversion of the epsilon_from_weather function.
+    # For a given epsilon and depth z_m, we can estimate u_star_water and then back out wind speed and wave height.
+
+    rho_air=1.225 # Air density [kg/m^3]
+    rho_water=1025.0 # Water density [kg/m^3]
+    kappa=0.4 # Von Karman constant
+    alpha = 0.3  # Terray et al. (1996) normalization constant 
+    u_star_water = (epsilon * kappa * z_m) ** (1/3) 
+    u_star_air = u_star_water * np.sqrt(rho_water / rho_air)
+
+    # Invert u*_air = sqrt(Cd(U10)) * U10 with the Large & Pond (1981) Cd. Above 11 m/s Cd depends on U10,
+    # so u*_air^2 = (0.49 + 0.065*U10)*1e-3 * U10^2 has no simple closed form -> invert numerically on a grid.
+    U10_grid = np.logspace(-5, 2, 4000)
+    Cd_grid = np.where(U10_grid < 11, 1.2e-3, (0.49 + 0.065 * U10_grid) * 1e-3)
+    u_star_air_grid = np.sqrt(Cd_grid) * U10_grid
+    wind_speed_ms = np.interp(u_star_air, u_star_air_grid, U10_grid)
+
+    # Estimate significant wave height from u_star_water
+    sig_wave_height_m = 0.6 * (u_star_water ** 2) / (alpha * u_star_water ** 3)
+
+    return wind_speed_ms, sig_wave_height_m
+
+#%% Define epsilon values to simulate
+windspeed_min = 0.01  # [m/s]
+wave_height_min = 0.01  # [m]
+
+windspeed_max = 12.0  # [m/s]
+wave_height_max = 3.0  # [m]
+
+default_z_m = 0.09  # [m] depth below the surface to evaluate epsilon at, 9 cm is the depth of the experimental tank
+
+epsilon_min = epsilon_from_weather(windspeed_min, wave_height_min, z_m=default_z_m)  # [m^2/s^3]
+epsilon_max = epsilon_from_weather(windspeed_max, wave_height_max, z_m=default_z_m)  # [m^2/s^3]
+
+print(f"Estimated epsilon range from weather: {epsilon_min:.2e} to {epsilon_max:.2e} m^2/s^3")
 
 # %% Set parameters of the velocity field and simulation
 
@@ -198,10 +230,10 @@ fps = 25 # temporal resolution [fps]
 t_simulation = 60 # total length of simulation [s]
 
 ### Parameters for velocity field (in SI units * 1e6 to convert to mm)
-nu = 1e-6 * 1e6 # Kinematic viscosity of sea water depends on salinity and temperature. Ranges from 1e-6 to 1.8e-6, times 1e-6 to convert to mm
+nu = 1e-6 * 1e6 # Kinematic viscosity [mm^2/s]: 1e-6 m^2/s (sea water ranges ~1e-6 to 1.8e-6 m^2/s), times 1e6 to convert m^2 -> mm^2
 N = 50 # Total number of wave numbers sampled
 L = tank_size / 5 # Maximum length scale of turbulence [mm]
-epsilon_si = 1e-6 # Dissipation rate [mm^2/s^3] 
+epsilon_si = 1e-6 # Dissipation rate [m^2/s^3]
 epsilon = epsilon_si * 1e6  # convert to mm^2/s^3
 
 eta = (nu**3 / epsilon) ** (1/4)   # Define eta (Kolmogorov length scale)
@@ -225,6 +257,7 @@ stride = max(1, grid_size // N_quiver)  # stride for quiver plot (to reduce numb
 
 timesteps = t_simulation * fps # total number of timesteps
 
+### Create velocity field
 velocity_field, field_params = create_velocity_field(epsilon, nu, N, L, grid_size, tank_size, timesteps, fps)
 
 #%% Validate the velocity field

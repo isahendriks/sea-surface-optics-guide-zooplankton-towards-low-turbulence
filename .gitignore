@@ -28,6 +28,7 @@ env/
 
 # Data files -- all data is stored separately on OneDrive, not in this repo
 data/
+output/
 *.pkl
 *.pickle
 *.csv

@@ -1,7 +1,11 @@
+// Calm light regime: a steady point light source.
+// Draws a filled circle of radius 0 (a single LED) at the centre of the 32 x 32 LED matrix,
+// in white at full intensity.
+
 #include <RGBmatrixPanel.h>
 
-#define CLK  8  
-
+// Pins of the LED matrix
+#define CLK  8
 #define OE   9
 #define LAT 10
 #define A   A0
@@ -15,24 +19,11 @@ void setup() {
   matrix.begin();
 }
 
-
 void loop() {
+  int center_x = 16;   // x coordinate of the light source
+  int center_y = 16;   // y coordinate of the light source
+  int radius = 0;      // radius of the light source [LEDs]; 0 = a single LED
+  int intensity = 255; // intensity (0-255)
 
-  int center_x, center_y, radius, intensity, x_cord, y_cord, x_width, y_width;
-
-  // Circle parameters - No longer used
-  center_x = 16;
-  center_y = 16;
-  radius = 0.5;
-
-  // Rectangle parameters - currently used
-  intensity = 255; // 8 bit (255 color tones)
-  x_cord = 0; 
-  y_cord = 0;
-  x_width = 10;
-  y_width = 10;
-  
-   matrix.fillCircle(center_x, center_y, radius, matrix.Color888(intensity, intensity, intensity));
-   //matrix.fillRect(x_cord, y_cord, x_width, y_width, matrix.Color888(intensity, intensity, intensity));
-     
+  matrix.fillCircle(center_x, center_y, radius, matrix.Color888(intensity, intensity, intensity));
 }

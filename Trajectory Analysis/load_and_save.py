@@ -1,249 +1,179 @@
+"""
+Load, clean and save the tracked trajectories, and test the effect of the light regime
+on the vertical swimming velocity and the swimming direction.
+
+For every species, light regime ("still" = calm, "breeze" = moderate, "stormy" = rough,
+"nothing" = no light, control) and tank, the tracks are
+  1. scaled from pixels to mm (y axis pointing up),
+  2. converted to per-frame velocities dx, dy [mm/s],
+  3. cut to the analysis time window (not for the control),
+  4. cleaned of tracking artifacts (steps < ARTIFACT_THRESHOLD in x or y),
+  5. gap filled by linear interpolation,
+  6. given an orientation (swimming direction) and speed,
+  7. cleaned of stationary tracks (net displacement < MIN_MOVEMENT) and
+  8. of short tracks (< min_frames frames).
+The cleaned tables are saved as traj_<regime>_scaled.pkl (used by plot_full_per_species.py
+and the kinematic simulations). Per tank, the mean dy and the speed-weighted circular
+variance V of the swimming direction are computed; regimes are compared with a one-way
+ANOVA and Tukey's HSD, using the tanks as replicates.
+
+Input:  <TRACKING_DATA_DIR>/<species>/tracking_results/<regime><tank>.xml
+Output: <TRACKING_DATA_DIR>/<species>/trajectories_scaled/traj_<regime>_scaled.pkl
+"""
+#%% Imports and settings
+from pathlib import Path
+
 import numpy as np
 import pandas as pd
-import os
-import pickle
-import matplotlib.pyplot as plt
 import scipy as sp
 
-from post_processing_functions import (
-    count_stationary_traj,
-    fill_gaps_linear,
-    load_frames,
-    load_xml,
-    slice_time_window,
-    tukey_posthoc,
-)
+from post_processing_functions import (count_stationary_traj, fill_gaps_linear, load_xml, slice_time_window,
+                                       speed_weighted_circular_variance, tukey_posthoc)
 
-# Define the measurement to analyze
-measurement = 'Cladocerans_2605'
+# Folder with one subfolder per species (download the tracking data set and point to it here)
+TRACKING_DATA_DIR = Path(__file__).resolve().parent / "data"
 
-path_to_tracking_data = "R:\\LU24A1047-PLS\\TrackingData\\"
-path_to_tracking_results = os.path.join(path_to_tracking_data, measurement, 'tracking_results')
-path_to_save_scaledtraj = os.path.join(path_to_tracking_data, measurement, 'trajectories_scaled')
-os.makedirs(path_to_save_scaledtraj, exist_ok=True)
+FRAME_RATE = 10               # [frames/s]
+MIN_MOVEMENT = 0.3            # tracks with a smaller net displacement are stationary [mm]
+ARTIFACT_THRESHOLD = 0.0001   # steps smaller than this in x or y are tracking artifacts [mm]
+REGIMES = ['still', 'breeze', 'stormy', 'nothing']  # calm, moderate, rough, control (no light)
 
-if measurement == 'Artemia_0805':
-    path_raw_avi = os.path.join(path_to_tracking_data, "Artemia_0805\\resized_videos\\still1.avi")
-    path_cropped_avi = os.path.join(path_to_tracking_data, "Artemia_0805\\cropped_videos\\still1.avi")
-    h_cropped_pxl, w_cropped_pxl = 1280, 853 # height, width of cropped video [pxl]
-    w_raw_pxl, h_raw_pxl = 853, 1280 # width, height of raw video [pxl]
-    w_raw_mm = 70.6 # width of raw video [mm]
-    binning = 1 # binning factor of the camera used to record the raw video
-    time_start = 150 # start time of the analysis window [frames]
-    time_end =  10000 # end time of the analysis window [frames]
-    min_frames = 30 # minimum number of frames for a trajectory to be included in the analysis
-    tanks = ['1', '2', '3'] # number of tanks per treatment
+# Recording settings per species
+#   h_cropped_pxl: height of the cropped video that was tracked [pxl] (to flip the y axis)
+#   w_raw_pxl, w_raw_mm: width of the raw video [pxl] and the field of view it covers [mm]
+#   binning: binning of the tracked video relative to the raw video
+#   time_start, time_end: analysis time window [frames] (time_start skips the acclimation)
+#   min_frames: shortest track that is kept [frames]
+SPECIES = {
+    'Artemia_0805': dict(h_cropped_pxl=1280, w_raw_pxl=853, w_raw_mm=70.6, binning=1,
+                         time_start=150, time_end=10000, min_frames=30, tanks=['1', '2', '3']),
+    'BarnacleLarvae_2102': dict(h_cropped_pxl=630, w_raw_pxl=3648, w_raw_mm=110, binning=4,
+                                time_start=0, time_end=10000, min_frames=30, tanks=['1', '2', '3']),
+    'Cladocerans_2605': dict(h_cropped_pxl=533, w_raw_pxl=2256, w_raw_mm=90.6, binning=4,
+                             time_start=0, time_end=10000, min_frames=30, tanks=['1', '2', '3', '4', '5']),
+}
 
-elif measurement == 'BarnacleLarvae_2102':
-    path_raw_avi = os.path.join(path_to_tracking_data, os.path.join(measurement, "raw_videos", "still1.avi"))
-    path_cropped_avi = os.path.join(path_to_tracking_data, os.path.join(measurement, "cropped_videos", "still1.avi"))
-    cropped_frame = load_frames(path_cropped_avi,1)[0]
-    h_cropped_pxl, w_cropped_pxl = 630, 930 # height, width of cropped video [pxl]
-    w_raw_pxl, h_raw_pxl = 3648, 5472 # width, height of raw video [pxl]
-    w_raw_mm = 110 # width of raw video [mm]
-    binning = 4 # binning factor of the camera used to record the raw video
-    time_start = 0 # start time of the analysis window [frames]
-    time_end =  10000 # end time of the analysis window [frames]
-    min_frames = 30 # minimum number of frames for a trajectory to be included in the analysis
-    tanks = ['1', '2', '3'] # number of tanks per treatment
+#%% Functions
 
-elif measurement == 'Cladocerans_2605':
-    path_raw_avi = os.path.join(path_to_tracking_data, "Cladocerans_2605\\resized_videos\\still1.avi")
-    path_cropped_avi = os.path.join(path_to_tracking_data, "Cladocerans_2605\\cropped_videos\\still1.avi")
-    h_cropped_pxl, w_cropped_pxl = 533, 549 # height, width of cropped video [pxl]
-    h_raw_pxl, w_raw_pxl = 2256, 2256 # height, width of raw video [pxl]
-    w_raw_mm = 90.6 # width of raw video [mm]
-    binning = 4 # binning factor of the camera used to record the raw video
-    time_start = 0 # start time of the analysis window [frames]
-    time_end =  10000 # end time of the analysis window [frames]
-    min_frames = 30 # minimum number of frames for a trajectory to be included in the analysis
-    tanks = ['1', '2', '3', '4', '5']   # number of tanks per treatment
-    
-else:
-    raise ValueError("Measurement not recognized.")
+def process_tank(df, regime, tank, settings, scale):
+    """Clean the tracks of one tank, as loaded by load_xml (steps 1-8 above)."""
+    # 1. Scale to mm and flip the y axis so it points up
+    df['x'] = df['x'].astype(float) * scale
+    df['y'] = (settings['h_cropped_pxl'] - df['y'].astype(float) - 1) * scale
 
-# Calculate scale factor to convert pixel coordinates to mm
-scale = w_raw_mm / w_raw_pxl
-scale = scale * binning
+    # 2. Velocity per frame [mm/s]; drops the first detection of every track
+    df = df.sort_values(['particle', 't']).reset_index(drop=True)
+    df['dt'] = df.groupby('particle')['t'].diff()
+    df['dx'] = df.groupby('particle')['x'].diff() / df['dt'] * FRAME_RATE
+    df['dy'] = df.groupby('particle')['y'].diff() / df['dt'] * FRAME_RATE
+    df = df.dropna(subset=['dx', 'dy', 'dt']).reset_index(drop=True)
 
-# Define parameters for trajectory analysis
-min_movement = 0.3
-artifact_treshold = 0.0001
+    # 3. Analysis time window (the control keeps the full recording)
+    if regime != 'nothing':
+        df = slice_time_window(df, settings['time_start'], settings['time_end'])
+    df = df.reset_index(drop=True)
 
-frame_rate = 10
+    # 4. Remove artifacts: steps with |x or y change| below the threshold since the previous
+    #    detection of the track (this also drops the first remaining detection of every track)
+    x_diff = df.groupby('particle', sort=False)['x'].diff().abs()
+    y_diff = df.groupby('particle', sort=False)['y'].diff().abs()
+    df = df[(x_diff >= ARTIFACT_THRESHOLD) & (y_diff >= ARTIFACT_THRESHOLD)]
 
-analysis_time_start = time_start
-analysis_time_end = time_end
+    # 5. Fill gaps (inserted frames get a position but no velocity)
+    df = fill_gaps_linear(df)
 
-# define treatments
-treatments = ['still', 'breeze', 'stormy', 'nothing']
+    # 6. Swimming direction and speed
+    df['orientation'] = np.arctan2(df['dy'], df['dx'])  # [rad]
+    df['orientation_degrees'] = np.degrees(df['orientation'])
+    df['speed'] = np.sqrt(df['dx'] ** 2 + df['dy'] ** 2)  # [mm/s]
 
-# Load and visualize tracking results for a random selection of frames to validate the tracking results
-treatment = 'still1'
-path_xml = os.path.join(path_to_tracking_results, treatment + ".xml")
-path_avi = os.path.join(path_to_tracking_data, measurement, "cropped_videos", treatment + ".avi")
+    # 7. Remove stationary tracks
+    stat_ids = count_stationary_traj(df, threshold=MIN_MOVEMENT)
+    if stat_ids:
+        df = df[~df['particle'].isin(stat_ids)].reset_index(drop=True)
 
-df = load_xml(path_xml)
-frames = load_frames(path_avi)
+    df['tank'] = int(tank)
 
-num_frames = len(frames)
-indices = np.random.randint(0, num_frames, size=10)
-
-w,h = frames[1].shape
-
-for i in indices:
-    print(['figure ' + str(i) + '/' + str(len(frames))])
-    frame = frames[i]
- 
-    df_current_frame = df[df['t'] == i]
-    x_pos = df_current_frame['x'].values
-    y_pos = df_current_frame['y'].values
-
-    plt.figure()
-    plt.imshow(frame, cmap='gray')
-    plt.scatter(x_pos, y_pos, s=25, edgecolors='r', facecolors='none')
-    plt.show()
-    plt.close()
-
-# Load and process tracking results for all treatments and tanks
-dfs=[None]*len(treatments)
-organisms_per_tank = []
-
-for i, treatment in enumerate(treatments):
-    data_perframe = []
-
-    for tank in tanks:
-        print(f"\rProcessing {treatment} {tank} ...", end='\r', flush=True)
-        
-        path_xml = os.path.join(path_to_tracking_results, treatment + tank + ".xml")  # Define path to the XML file for the current treatment and tank
-        df_tank = load_xml(path_xml)  # Load the tracking data from the XML file into a DataFrame
-        
-        # Count the number of organisms in the tank at time t=0 to make estimate of the number of organisms per tank
-        organisms_tank = len(df_tank[df_tank['t'] == 0])*2
-        organisms_per_tank.append(organisms_tank)
-        
-        # 1. Scale the full data and flip y-axis to match the orientation of the video
-        df_tank['x'] = df_tank['x'].astype(float) * scale
-        df_tank['y'] = (h_cropped_pxl - df_tank['y'].astype(float) - 1) * scale    
-
-        # 2. Compute dx/dy on full trajectory
-        df_tank = df_tank.sort_values(['particle', 't']).reset_index(drop=True)
-        df_tank['dt'] = df_tank.groupby('particle')['t'].diff()
-        df_tank['dx'] = df_tank.groupby('particle')['x'].diff() / df_tank['dt'] * frame_rate
-        df_tank['dy'] = df_tank.groupby('particle')['y'].diff() / df_tank['dt'] * frame_rate
-
-        # Drop rows with NaN values in dx, dy, dt (first entry of each trajectory and any trajectories with only one spot)
-        df_tank = df_tank.dropna(subset=['dx', 'dy', 'dt']).reset_index(drop=True)
-        
-        # 3. Filter time window
-        if treatment != 'nothing':  # For control treatment, keep full time window for analysis
-            df_tank = slice_time_window(df_tank, time_start, time_end)
-        
-        df_tank = df_tank.reset_index(drop=True)
-        
-        # 4. remove artifacts and lineraly interpolate gaps in trajectories
-        x_diff = df_tank.groupby('particle', sort=False)['x'].diff().abs()
-        y_diff = df_tank.groupby('particle', sort=False)['y'].diff().abs()
-        df_tank = df_tank[(x_diff >= artifact_treshold) & (y_diff >= artifact_treshold)]
-        df_tank = fill_gaps_linear(df_tank, max_gap=5, frame_rate=frame_rate)
- 
-        # 6. Calculate orientation and speed
-        df_tank['orientation'] = np.arctan2(df_tank['dy'], df_tank['dx']) #[radians]
-        df_tank['orientation_degrees'] = np.degrees(df_tank['orientation']) #[degrees]
-        df_tank['speed'] = np.sqrt(df_tank['dx'] ** 2 + df_tank['dy'] ** 2) #[mm/s]  
-        
-        # 7. Remove stationary trajectories (displacement < min_movement) 
-        stat_ids = count_stationary_traj(df_tank, threshold=min_movement)
-        if stat_ids:
-            df_tank = df_tank[~df_tank['particle'].isin(stat_ids)].reset_index(drop=True)
-
-        df_tank['tank'] = int(tank)  # Add tank number as integer column
-
-        # 8. Remove short trajectories (less than min_frames)
-        df_tank['nSpots'] = df_tank.groupby('particle')['t'].transform('count')
-        df_tank = df_tank[df_tank['nSpots'] >= min_frames].reset_index(drop=True)
-
-        data_perframe.append(df_tank) # Dataframe after processing with all trajectories per frame
-        
-    dfs[i] = pd.concat(data_perframe, ignore_index=True)
+    # 8. Remove short tracks
+    df['nSpots'] = df.groupby('particle')['t'].transform('count')
+    df = df[df['nSpots'] >= settings['min_frames']].reset_index(drop=True)
+    return df
 
 
-# Save scaled and processed data into pickle files for plotting scripts    
-for i, df in enumerate(dfs):
-    df.to_pickle(os.path.join(path_to_save_scaledtraj, f'traj_{treatments[i]}_scaled.pkl'))
+def analyze_species(measurement):
+    settings = SPECIES[measurement]
+    tanks = settings['tanks']
+    scale = settings['w_raw_mm'] / settings['w_raw_pxl'] * settings['binning']  # [mm/pxl]
 
-# Find the minimum end time across all treatments (excluding control) to ensure consistent analysis window
-min_end_time = float('inf')
-for df in dfs[:-1]:  # Exclude control treatment which has full time window
-    for tank in tanks:
-        end_time = df[df['tank'] == int(tank)]['t'].max()
-        if end_time < min_end_time:
-            min_end_time = end_time
+    path_results = TRACKING_DATA_DIR / measurement / 'tracking_results'
+    path_save = TRACKING_DATA_DIR / measurement / 'trajectories_scaled'
+    path_save.mkdir(parents=True, exist_ok=True)
 
-# Adjust analysis_time_end to the minimum end time across treatments
-if analysis_time_end > min_end_time:
-    analysis_time_end = min_end_time
+    ### Load and clean all tanks, and save the cleaned tables
+    dfs = []
+    organisms_per_tank = []
+    for regime in REGIMES:
+        data_regime = []
+        for tank in tanks:
+            print(f"\rProcessing {regime} {tank} ...", end='\r', flush=True)
+            df_tank = load_xml(path_results / f"{regime}{tank}.xml")
 
-# Slice the dataframes for each treatment to the analysis time window
-df_still_perframe = slice_time_window(dfs[0], analysis_time_start, analysis_time_end)
-df_breeze_perframe = slice_time_window(dfs[1], analysis_time_start, analysis_time_end)
-df_stormy_perframe = slice_time_window(dfs[2], analysis_time_start, analysis_time_end)
-df_control_perframe = slice_time_window(dfs[3], 0, analysis_time_end)
+            # Rough estimate of the number of animals in the tank: detections at t = 0, times 2
+            organisms_per_tank.append(len(df_tank[df_tank['t'] == 0]) * 2)
 
-# Calculate mean dy for each tank and treatment
-still_means_perframe = [np.mean(df_still_perframe['dy'][df_still_perframe['tank'] == int(tank)]) for tank in tanks]
-breeze_means_perframe = [np.mean(df_breeze_perframe['dy'][df_breeze_perframe['tank'] == int(tank)]) for tank in tanks]
-stormy_means_perframe = [np.mean(df_stormy_perframe['dy'][df_stormy_perframe['tank'] == int(tank)]) for tank in tanks]
-control_means_perframe = [np.mean(df_control_perframe['dy'][df_control_perframe['tank'] == int(tank)]) for tank in tanks]    
+            data_regime.append(process_tank(df_tank, regime, tank, settings, scale))
+        dfs.append(pd.concat(data_regime, ignore_index=True))
 
-# Calculate means and 95% CI for each treatment
-means_perframe = [np.mean(still_means_perframe), np.mean(breeze_means_perframe), np.mean(stormy_means_perframe), np.mean(control_means_perframe)]
-STD_perframe = [np.std(still_means_perframe, ddof=1), np.std(breeze_means_perframe, ddof=1), np.std(stormy_means_perframe, ddof=1), np.std(control_means_perframe, ddof=1)]
-n_replicates = len(tanks)
-t_critical = sp.stats.t.ppf(0.975, df=n_replicates - 1)
-CI95_perframe = [STD_perframe[i] / np.sqrt(n_replicates) * t_critical for i in range(len(treatments))]
+    for regime, df in zip(REGIMES, dfs):
+        df.to_pickle(path_save / f'traj_{regime}_scaled.pkl')
 
-# Calculate V for each tank and treatment
-def V(angles: np.ndarray) -> float:
-    angles = angles[~np.isnan(angles)]
-    R = np.sqrt(np.mean(np.sin(angles))**2 + np.mean(np.cos(angles))**2)
-    return 1 - R
+    ### Common analysis window: end at the shortest recording of the light regimes
+    analysis_time_start = settings['time_start']
+    analysis_time_end = settings['time_end']
+    for df in dfs[:-1]:
+        for tank in tanks:
+            end_time = df[df['tank'] == int(tank)]['t'].max()
+            if end_time < analysis_time_end:
+                analysis_time_end = end_time
 
-still_V_perframe = [V(df_still_perframe['orientation'][df_still_perframe['tank'] == int(tank)].values) for tank in tanks]
-breeze_V_perframe = [V(df_breeze_perframe['orientation'][df_breeze_perframe['tank'] == int(tank)].values) for tank in tanks]
-stormy_V_perframe = [V(df_stormy_perframe['orientation'][df_stormy_perframe['tank'] == int(tank)].values) for tank in tanks]
-control_V_perframe = [V(df_control_perframe['orientation'][df_control_perframe['tank'] == int(tank)].values) for tank in tanks]
+    dfs_window = [slice_time_window(df, analysis_time_start, analysis_time_end) for df in dfs[:-1]]
+    dfs_window.append(slice_time_window(dfs[-1], 0, analysis_time_end))  # control from t = 0
 
-mean_V_perframe = [np.mean(still_V_perframe), np.mean(breeze_V_perframe), np.mean(stormy_V_perframe), np.mean(control_V_perframe)]
-STD_V_perframe = [np.std(still_V_perframe, ddof=1), np.std(breeze_V_perframe, ddof=1), np.std(stormy_V_perframe, ddof=1), np.std(control_V_perframe, ddof=1)]
-CI95_V_perframe = [STD_V_perframe[i] / np.sqrt(n_replicates) * t_critical for i in range(len(treatments))]
+    ### Per tank: mean dy and speed-weighted circular variance V
+    tank_means = [[np.mean(df['dy'][df['tank'] == int(tank)]) for tank in tanks] for df in dfs_window]
+    tank_V = [[speed_weighted_circular_variance(df[df['tank'] == int(tank)]) for tank in tanks] for df in dfs_window]
 
-f_stat_perframe, p_value_perframe = sp.stats.f_oneway(still_means_perframe, breeze_means_perframe, stormy_means_perframe)
-f_stat_V_perframe, p_value_V_perframe = sp.stats.f_oneway(still_V_perframe, breeze_V_perframe, stormy_V_perframe)
+    n_replicates = len(tanks)
+    means = [np.mean(m) for m in tank_means]
+    SE = [np.std(m, ddof=1) / np.sqrt(n_replicates) for m in tank_means]
+    mean_V = [np.mean(v) for v in tank_V]
+    SE_V = [np.std(v, ddof=1) / np.sqrt(n_replicates) for v in tank_V]
 
-print(f"\n=== Statistical results for {measurement} ===")
-print(f"Analysis window: {analysis_time_start} to {analysis_time_end} frames")
-print(f"Artifact threshold: {artifact_treshold:.4f} mm / {artifact_treshold/scale:.4f} pxls")
-print(f"Minimum movement to consider non-stationary: {min_movement:.2f} mm / {min_movement/scale:.2f} pxls")
-print(f"Minimum trajectory length: {min_frames} frames / {min_frames/frame_rate:.1f} seconds")
+    ### One-way ANOVA and Tukey's HSD over the three light regimes (not the control)
+    _, p_value = sp.stats.f_oneway(*tank_means[:3])
+    _, p_value_V = sp.stats.f_oneway(*tank_V[:3])
+    letters = tukey_posthoc(REGIMES[:3], tank_means[:3])
+    letters_V = tukey_posthoc(REGIMES[:3], tank_V[:3])
 
-print(f"\n=== ANOVA results for {measurement} ===")
-print(f"P-value dy: {p_value_perframe:.4f}")
-print(f"P-value V: {p_value_V_perframe:.4f}")
+    print(f"\n=== Statistical results for {measurement} ===")
+    print(f"Analysis window: {analysis_time_start} to {analysis_time_end} frames")
+    print(f"Artifact threshold: {ARTIFACT_THRESHOLD:.4f} mm / {ARTIFACT_THRESHOLD/scale:.4f} pxls")
+    print(f"Minimum movement to consider non-stationary: {MIN_MOVEMENT:.2f} mm / {MIN_MOVEMENT/scale:.2f} pxls")
+    print(f"Minimum trajectory length: {settings['min_frames']} frames / {settings['min_frames']/FRAME_RATE:.1f} seconds")
 
-group_means_perframe, letters_perframe, tukey_table_perframe = tukey_posthoc(
-    treatments,
-    [still_means_perframe, breeze_means_perframe, stormy_means_perframe, control_means_perframe],
-)
+    print(f"\n=== ANOVA results for {measurement} ===")
+    print(f"P-value dy: {p_value:.4f}")
+    print(f"P-value V: {p_value_V:.4f}")
 
-group_means_V_perframe, letters_V_perframe, tukey_table_V_perframe = tukey_posthoc(
-    treatments,
-    [still_V_perframe, breeze_V_perframe, stormy_V_perframe, control_V_perframe],
-)
+    print("\n=== Mean dy and speed weighted circular variance V (per frame), mean ± SE over the tanks ===")
+    for i, regime in enumerate(REGIMES):
+        # The control has no letter (not part of the Tukey test)
+        print(f"{regime.capitalize()}: Mean dy = {means[i]:.2f} ± {SE[i]:.2f} mm/s  [{letters.get(regime, '-')}], "
+              f"V = {mean_V[i]:.3f} ± {SE_V[i]:.3f}  [{letters_V.get(regime, '-')}]")
 
-print("\n=== Mean dy (per frame)===")
-for i, treatment in enumerate(treatments):
-    print(f"{treatment.capitalize()}: Mean dy = {means_perframe[i]:.2f} ± {STD_perframe[i]:.2f} mm/s  [{letters_perframe[treatment]}], V = {mean_V_perframe[i]:.2f} ± {STD_V_perframe[i]:.2f}")
+    print(f"mean number of organisms per tank: {np.mean(organisms_per_tank):.1f} ± {np.std(organisms_per_tank, ddof=1):.1f}")
 
-print(f"mean number of organisms per tank: {np.mean(organisms_per_tank):.1f} ± {np.std(organisms_per_tank, ddof=1):.1f}")
-    
+#%% Run all species
+if __name__ == "__main__":
+    for measurement in SPECIES:
+        analyze_species(measurement)
